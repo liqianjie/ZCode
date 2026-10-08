@@ -224,6 +224,26 @@ G:\zcode-win-dist\
 | 动作 | `powershell.exe -File G:\zcode-win-dist\win-autoinstall.ps1`（常驻） |
 | 行为 | 每 60 秒检查待装标记 → 确认应用未运行 → `安装程序.exe /S` → 校验版本 → 删除标记 |
 
+**安装目录在哪（很容易想当然，实测纠偏）**
+
+```powershell
+# 错误假设：%LOCALAPPDATA%\Programs\千寻\千寻.exe
+# 实际路径：
+%LOCALAPPDATA%\Programs\@zcodedesktop\千寻.exe
+```
+
+electron-builder 的 per-user 安装目录名取自**清洗后的 `package.json` name**
+（上游 `@zcode/desktop` → `@zcodedesktop`），只有目录内的**可执行文件名**才由
+`productName` 决定（所以是 `千寻.exe`，卸载器是 `Uninstall 千寻.exe`）。
+
+早先代理硬编码了错误路径，导致**安装明明成功（退出码 0）却判定失败、反复重试**。
+现在改为动态探测：先读注册表卸载项（`DisplayName = "千寻 <version>"`；
+注意 `InstallLocation` 实测为空，真正带路径的是 `UninstallString`）反推目录，
+再兜底扫描 `%LOCALAPPDATA%\Programs\*\千寻.exe`。
+
+代理还用全局命名互斥量 `Global\ZCodeQianxunAutoInstall` 做了**单实例保护** ——
+「登录触发」与「手工 `Start-ScheduledTask`」可能同时拉起两个实例，并发静默安装会互相覆盖。
+
 日常查看与操作：
 
 ```powershell
@@ -238,7 +258,7 @@ Get-Content "G:\zcode-win-dist\autoinstall.log" -Encoding UTF8 -Tail 30   # 看�
 - **应用运行中不覆盖安装**。NSIS 覆盖运行中的程序会失败或留下半装状态，
   代理会等到应用退出后再装 —— 也就是说你开着千寻时，新版本要等你关掉它才装上。
 - **装完不自动拉起应用**，避免打断你手头的事；自己点快捷方式即可用上新版本。
-- **同一版本只装一次**：代理会比对 `%LOCALAPPDATA%\Programs\千寻\千寻.exe` 的版本号。
+- **同一版本只装一次**：代理会比对已安装 `千寻.exe` 的 `ProductVersion`（路径动态探测，见上）。
 - **失败最多重试 3 次**，仍失败就把标记归档为 `install-failed.json`，等下一次投递，避免死循环。
 
 ### 时间线（每天 09:30 触发，构建约 11 分钟）
@@ -370,6 +390,16 @@ dubious ownership 并直接 `exit 128`。`actions/checkout` 只在自己的临�
 所以发布环节出问题（API 限流、网络抖动、token 权限）时，
 **本机照样能拿到并装上包**，只是 Releases 页面没有对应资产。
 反过来如果投递失败，发布仍会继续 —— 看 run 的步骤结论区分是哪一环。
+
+**Release 建出来了但是空的（没有任何资产）**
+去重标记 `win-<short>` 必须在创建 Release **之前**推上去（否则 Release 的 tag 会被
+GitHub 建在 fork main 的 HEAD，指不到本次构建的上游提交），于是存在一个窗口：
+tag 推成功、但 Release 创建或资产上传失败。这时 tag 已存在，下一次定时任务会误判
+「已构建过」直接跳过，该上游提交就永远发不出包。
+
+workflow 已加 `发布失败时回滚去重标记` 步骤收口：只在本次确实新建了 tag
+（`steps.check.outputs.exists == 'false'`）时回滚，发布会失败则该提交下次重试。
+若看到历史上遗留的空 Release，删掉它的 tag 再手动触发一次即可。
 
 **⚠️ 安全红线**
 本仓库是 public。self-hosted runner **绝不可**对 `pull_request` / `pull_request_target` 开放，

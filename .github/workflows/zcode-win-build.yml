@@ -399,7 +399,7 @@ jobs:
             - 后端环境：${{ env.EFF_BACKEND_ENV }}
             - 产物：NSIS 安装程序${{ env.EFF_DESKTOP_ZIP == 'true' && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
             - runner：self-hosted Windows x64
-          DIST_DIR: src/packages/desktop/dist
+          DIST_DIR: ${{ github.workspace }}/src/packages/desktop/dist
           # git 的「仓库属主不匹配」安全检查（safe.directory）。
           #
           # runner 以 NETWORK SERVICE 常驻，而 G:\actions-runner-zcode-win\_work\... 工作区
@@ -419,6 +419,31 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" \
             "HEAD:refs/tags/win-${{ steps.upstream.outputs.short }}"
           node "$GITHUB_WORKSPACE/.branding-src/branding/publish-win-release.mjs"
+
+      # 去重标记的「诚实性」补偿。
+      #
+      # 判定「该上游提交是否已构建过」靠的是 tag win-<short>，而 tag 必须在创建
+      # Release 之前推上去（否则 Release 的 tag 会被 GitHub 建在 fork main 的 HEAD，
+      # 指不到本次构建的上游提交）。于是存在一个窗口：tag 推成功、但 Release 创建或
+      # 资产上传失败 —— 此时 tag 已存在，下一次定时任务会认为「已构建过」直接跳过，
+      # 导致这个上游提交永远发不出包（实测踩到过：run 37751995192 就是空 Release + 有 tag）。
+      #
+      # 这里在发布失败时把 tag 撤掉，让下一次定时任务重新打包。
+      # 只在本次确实新建了 tag（check.exists == 'false'）时才回滚，避免误删历史标记。
+      - name: 发布失败时回滚去重标记
+        if: ${{ failure() && steps.decide.outputs.build == 'true' && steps.check.outputs.exists == 'false' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: "*"
+        run: |
+          set -uo pipefail
+          TAG="win-${{ steps.upstream.outputs.short }}"
+          echo "发布失败，撤回去重标记 $TAG，让下次定时任务重新构建"
+          git push --delete \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" \
+            "refs/tags/$TAG" || echo "::warning::撤回 $TAG 失败，请手动删除该 tag（否则该提交不会重试）"
 
       - name: 清理构建产物（节省磁盘）
         if: always() && steps.decide.outputs.build == 'true'

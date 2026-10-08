@@ -3,10 +3,15 @@
 
   背景：
     GitHub Actions 的 Windows 打包 runner 以 NETWORK SERVICE 服务账户常驻（Session 0），
-    而 electron-builder 产出的 Windows 安装器是「按用户安装」（装到
-    %LOCALAPPDATA%\Programs\千寻）。若由服务账户执行安装，包会被装进
-    C:\Windows\ServiceProfiles\NetworkService\...，登录用户根本看不到。
+    而 electron-builder 产出的 Windows 安装器是「按用户安装」。若由服务账户执行安装，
+    包会被装进 C:\Windows\ServiceProfiles\NetworkService\...，登录用户根本看不到。
     因此 workflow 只负责「投递」，真正的安装由本脚本在用户会话里完成。
+
+  安装目录（实测，别想当然）：
+    electron-builder 的 per-user 安装目录名**不是 productName**，而是清洗后的
+    package.json name。上游包名 @zcode/desktop -> %LOCALAPPDATA%\Programs\@zcodedesktop\
+    目录内的可执行文件才由 productName 决定，即 千寻.exe。
+    所以本脚本用「注册表卸载项反推 + 扫描 Programs\*」定位，绝不硬编码目录名。
 
   工作方式：
     - 由计划任务在你登录时启动，常驻运行（默认每 60 秒检查一次）。
@@ -21,11 +26,21 @@
 param(
   [string]$DeliveryDir = "G:\zcode-win-dist",
   [int]$PollSeconds = 60,
-  [string]$AppProcessName = "千寻",
+  [string]$AppProductName = "千寻",
   [int]$MaxAttempts = 3
 )
 
 $ErrorActionPreference = "Stop"
+
+# 单实例保护：这个任务同时挂着「登录触发」和「手动启动」两条路径，
+# 两个实例并发静默安装会互相覆盖。用全局命名互斥量把后来者直接挡掉。
+$mutex = New-Object System.Threading.Mutex($false, "Global\ZCodeQianxunAutoInstall")
+$ownsMutex = $false
+try { $ownsMutex = $mutex.WaitOne(0) } catch { $ownsMutex = $true }
+if (-not $ownsMutex) {
+  Write-Host "已有安装代理实例在运行，本次退出"
+  exit 0
+}
 
 $logFile = Join-Path $DeliveryDir "autoinstall.log"
 $pendingFile = Join-Path $DeliveryDir "install-pending.json"
@@ -45,13 +60,63 @@ function Write-Log {
   }
 }
 
-# 安装后用来比对版本的 exe（electron-builder 的 per-user 安装路径）
-$installedExe = Join-Path $env:LOCALAPPDATA "Programs\$AppProcessName\$AppProcessName.exe"
+# ---------- 定位「已安装的千寻」 ----------
+#
+# 这里曾经踩过一个很隐蔽的坑：早先直接硬编码了
+#   $env:LOCALAPPDATA\Programs\千寻\千寻.exe
+# 结果安装明明成功（退出码 0），版本校验却永远失败，代理反复重试 3 次后放弃。
+# 原因是 electron-builder 的 per-user 安装目录名取自清洗后的 package.json name
+# （上游 @zcode/desktop -> @zcodedesktop），只有目录内的 exe 才用 productName。
+#
+# 解析顺序：
+#   1) 注册表卸载项反推 —— electron-builder 会写
+#      DisplayName = "千寻 <version>"，而 InstallLocation 实测为空，
+#      真正带路径的是 UninstallString：
+#        "C:\...\Programs\@zcodedesktop\Uninstall 千寻.exe" /currentuser
+#   2) 兜底：扫描 %LOCALAPPDATA%\Programs\*\千寻.exe
+function Resolve-InstalledExe {
+  $roots = @(
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+  foreach ($root in $roots) {
+    $entries = Get-ItemProperty -Path $root -ErrorAction SilentlyContinue |
+      Where-Object { $_.DisplayName -like "$AppProductName*" }
+    foreach ($entry in $entries) {
+      foreach ($raw in @($entry.InstallLocation, $entry.UninstallString)) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $m = [regex]::Match($raw, '"([^"]+\.exe)"')
+        if (-not $m.Success) { $m = [regex]::Match($raw, '([A-Za-z]:\\[^"]*?\.exe)') }
+        if (-not $m.Success) { continue }
+        $dir = Split-Path -Parent $m.Groups[1].Value
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $candidate = Join-Path $dir "$AppProductName.exe"
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+      }
+    }
+  }
 
+  $programsRoot = Join-Path $env:LOCALAPPDATA "Programs"
+  if (Test-Path -LiteralPath $programsRoot) {
+    $candidate = Get-ChildItem -LiteralPath $programsRoot -Directory -ErrorAction SilentlyContinue |
+      ForEach-Object { Join-Path $_.FullName "$AppProductName.exe" } |
+      Where-Object { Test-Path -LiteralPath $_ } |
+      Select-Object -First 1
+    if ($candidate) { return $candidate }
+  }
+  return $null
+}
+
+# 解析结果缓存到脚本作用域：安装前后都会调用，避免每次轮询都翻注册表。
+$script:installedExe = $null
 function Get-InstalledVersion {
-  if (-not (Test-Path -LiteralPath $installedExe)) { return $null }
+  if (-not $script:installedExe -or -not (Test-Path -LiteralPath $script:installedExe)) {
+    $script:installedExe = Resolve-InstalledExe
+  }
+  if (-not $script:installedExe) { return $null }
   try {
-    $v = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion
+    $v = (Get-Item -LiteralPath $script:installedExe).VersionInfo.ProductVersion
     if ([string]::IsNullOrWhiteSpace($v)) { return $null }
     return $v.Trim()
   } catch {
@@ -101,9 +166,9 @@ while ($true) {
     }
 
     # 应用运行中不覆盖安装：NSIS 覆盖运行中的程序会失败或留下半装状态
-    $running = @(Get-Process -Name $AppProcessName -ErrorAction SilentlyContinue)
+    $running = @(Get-Process -Name $AppProductName -ErrorAction SilentlyContinue)
     if ($running.Count -gt 0) {
-      Write-Log "$AppProcessName 正在运行（PID $($running.Id -join ',')），等应用退出后再装"
+      Write-Log "$AppProductName 正在运行（PID $($running.Id -join ',')），等应用退出后再装"
       Start-Sleep -Seconds $PollSeconds
       continue
     }
