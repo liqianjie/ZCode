@@ -131,3 +131,30 @@ for (const assetPath of assets) {
 }
 
 console.log(`Release ${tag} 发布完成：https://github.com/${repo}/releases/tag/${tag}`);
+
+// 4) 清理历史 Release —— 保持仓库体积可控。
+//
+// 定时流水线每有一个新上游提交就发一个新 Release（约 350 MB 产物），不清理会无限堆积。
+// 这里只保留最近 KEEP_WIN_RELEASES 个（默认 3），更旧的删除 Release 记录与其中资产。
+//
+// 关键：只删 Release、绝不删 tag。`win-<short_sha>` tag 是 workflow 判定
+// 「该上游提交是否已构建过」的唯一标记（见 zcode-win-build.yml 的 check 步骤），
+// 删掉 tag 会让同一个提交被反复重打包。Release 删掉后 tag 仍然留着，正好符合需要。
+//
+// 只处理 win-* 前缀，绝不触碰 macOS 流水线的 auto-* Release。
+const keep = Number(process.env.KEEP_WIN_RELEASES || 3);
+const allReleases = (await api("GET", `/repos/${repo}/releases?per_page=100`)).data || [];
+const winReleases = allReleases
+  .filter((item) => typeof item.tag_name === "string" && item.tag_name.startsWith("win-"))
+  .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+const stale = winReleases.slice(keep);
+if (stale.length === 0) {
+  console.log(`历史 Release 清理：win-* 共 ${winReleases.length} 个，无需清理（保留最近 ${keep} 个）`);
+} else {
+  console.log(`历史 Release 清理：win-* 共 ${winReleases.length} 个，删除最旧 ${stale.length} 个`);
+  for (const item of stale) {
+    const removed = await api("DELETE", `/repos/${repo}/releases/${item.id}`);
+    console.log(`  ${removed.ok ? "✓" : `×(${removed.status})`} ${item.tag_name}（tag 保留，仍作为去重标记）`);
+  }
+}

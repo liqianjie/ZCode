@@ -2,8 +2,18 @@ name: zcode-win-build
 
 # Windows 桌面安装包流水线（fork 专用，品牌：千寻 qianxun.io）
 #
-# 流程：检出上游 zai-org/ZCode -> 应用千寻品牌化 -> 追加免安装 zip 目标
-#       -> 在 self-hosted Windows runner 上打包 Windows x64 安装包 -> 上传产物（可选发 Release）
+# 流程：解析上游 ref -> 判断是否已构建过 -> 检出上游 zai-org/ZCode -> 应用千寻品牌化
+#       -> 追加 zip 目标与 ASCII 产物名 -> 在 self-hosted Windows runner 上打包
+#       -> 上传产物 / 发布 Release / 投递到本机安装区（由用户会话的计划任务静默安装）
+#
+# 触发方式：
+#   1) 定时：每天 09:30（北京时间）= 01:30 UTC，与 macOS 流水线（zcode-autoupdate.yml）同一时刻。
+#      上游 main 没新提交、或该提交已发过 Release 时直接跳过，不空跑一遍打包。
+#   2) 手动：workflow_dispatch，可指定上游 ref / 后端环境 / 是否发 Release。
+#
+# 关于「机器没开机」：本流水线跑在 self-hosted runner 上。定时触发时若机器离线，
+# job 会在 GitHub 侧排队（队列上限 24 小时），机器一上线 runner 立刻领取并开跑，
+# 因此「晚开机 = 晚一会儿拿到包」，不会丢任务。
 #
 # 为什么走 self-hosted：Windows 打包要下 Electron 41 运行时、NSIS 资源，并需要约 15-25G 工作区。
 # 放在自有机器上可以长期复用 pnpm store 与 electron 缓存，不消耗托管 runner 额度，
@@ -12,24 +22,31 @@ name: zcode-win-build
 # ---- 安全提示（务必遵守）----
 # 本仓库是 public。self-hosted runner 绝不可对 pull_request / pull_request_target 开放，
 # 否则任何 fork 的 PR 都能在你的打包机上执行任意代码（可读写本机文件、拿 runner 身份连内网）。
-# 本文件只保留 workflow_dispatch（手动触发），不要为了"方便"加 PR 触发。
+# 本文件只保留 schedule / workflow_dispatch，不要为了"方便"加 PR 触发。
 
 on:
+  schedule:
+    - cron: "30 1 * * *" # 01:30 UTC = 北京时间 09:30
   workflow_dispatch:
     inputs:
+      force_build:
+        description: "即使该上游提交已经发过 Release 也强制重新构建"
+        required: false
+        type: boolean
+        default: false
       upstream_ref:
         description: "上游 ref（分支名 / tag / commit sha），留空 = zai-org/ZCode main 最新提交"
         required: false
         type: string
         default: ""
       backend_env:
-        description: "后端环境：test 产出「千寻-<ver>-win-x64_TEST.exe」；production 产出不带 _TEST 后缀的生产包"
+        description: "后端环境：test 产出「Qianxun-<ver>-win-x64_TEST.exe」；production 产出不带 _TEST 后缀的生产包"
         required: true
         type: choice
         options:
           - test
           - production
-        default: test
+        default: production
       desktop_zip:
         description: "额外产出免安装 zip（win-unpacked 打成的绿色包）"
         required: true
@@ -39,12 +56,14 @@ on:
         description: "构建成功后创建/更新 GitHub Release 并上传产物（tag: win-<short_sha>）"
         required: true
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
 
 # 同一时间只允许一个 Windows 打包任务，避免两个 job 抢同一份 dist 与 pnpm store。
+# cancel-in-progress=false + 同 group 最多一个 pending：机器离线期间连排多次定时任务时，
+# 只会保留最后一次待跑的，不会堆积成串行长队。
 concurrency:
   group: zcode-win-build
   cancel-in-progress: false
@@ -70,6 +89,12 @@ env:
   # 品牌产品名（单一来源为 branding/product.json；此处与产物校验步骤共用同名变量）
   PRODUCT_NAME: 千寻
 
+  # ---------- 定时事件（schedule）无法传 workflow_dispatch 的 inputs，这里统一兜底 ----------
+  # 定时构建的语义是「上班前把最新正式版准备好」，因此默认走 production + 发 Release。
+  EFF_BACKEND_ENV: ${{ github.event_name == 'schedule' && 'production' || inputs.backend_env }}
+  EFF_DESKTOP_ZIP: ${{ github.event_name == 'schedule' && 'true' || inputs.desktop_zip }}
+  EFF_PUBLISH: ${{ github.event_name == 'schedule' && 'true' || inputs.publish_release }}
+
 jobs:
   build-win-x64:
     # label 与 runner 注册结果逐字一致（GitHub 侧实际标签：self-hosted / Windows / X64 / zcode-win）。
@@ -77,10 +102,10 @@ jobs:
     runs-on: [self-hosted, Windows, X64, zcode-win]
     timeout-minutes: 120
     env:
-      ZCODE_ENV: ${{ inputs.backend_env }}
+      ZCODE_ENV: ${{ github.event_name == 'schedule' && 'production' || inputs.backend_env }}
       # 品牌化只改写 preview 身份（productName/appId -> 千寻）。
       # production 后端要保住千寻身份，就必须显式打开 preview identity，否则产物会退回 ZCode 身份。
-      ZCODE_PREVIEW_IDENTITY: ${{ inputs.backend_env == 'production' && '1' || '0' }}
+      ZCODE_PREVIEW_IDENTITY: ${{ (github.event_name == 'schedule' || inputs.backend_env == 'production') && '1' || '0' }}
     defaults:
       run:
         # 不能用 shell: bash —— runner 以 Windows 服务（NETWORK SERVICE）常驻，服务账户只有机器级
@@ -115,7 +140,38 @@ jobs:
           echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "上游 $RAW = ${SHA:0:7}"
 
+      # 去重标记用 Release tag `win-<short_sha>`：发布一次即留下永久标记，
+      # 上游没新提交时定时任务只花几秒查一次 tag 就退出，不会每天空跑 11 分钟打包。
+      # 用 ls-remote 而不是 gh CLI —— self-hosted Windows runner 上没装 gh（见 md 文档）。
+      - name: 检查该上游提交是否已构建过
+        id: check
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          SHORT="${{ steps.upstream.outputs.short }}"
+          if git ls-remote --exit-code --tags https://github.com/liqianjie/ZCode.git "refs/tags/win-$SHORT" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "上游 ${SHORT}：Release win-${SHORT} 已存在"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "上游 ${SHORT}：未构建过，本次需要打包"
+          fi
+
+      - name: 决定是否构建
+        id: decide
+        working-directory: ${{ github.workspace }}
+        run: |
+          FORCE="${{ inputs.force_build }}"
+          if [ "${{ steps.check.outputs.exists }}" = "true" ] && [ "$FORCE" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新且已发布，本次跳过构建"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "开始构建（force_build=${FORCE}）"
+          fi
+
       - name: 检出上游源码
+        if: steps.decide.outputs.build == 'true'
         uses: actions/checkout@v4
         with:
           repository: zai-org/ZCode
@@ -125,9 +181,10 @@ jobs:
 
       # .branding-src 装的是本 fork main 上的「上游检出后要套的补丁」，目前包含：
       #   branding/  —— 品牌化与图标替换（macOS 流水线也在用同一份）
-      #   branding/patch-win-target.mjs    —— Windows 追加 zip 目标
+      #   branding/patch-win-target.mjs    —— Windows 追加 zip 目标 + ASCII 产物名
       #   branding/publish-win-release.mjs —— 发布 Release
       - name: 检出 fork 侧补丁
+        if: steps.decide.outputs.build == 'true'
         uses: actions/checkout@v4
         with:
           repository: liqianjie/ZCode
@@ -138,18 +195,24 @@ jobs:
           fetch-depth: 1
 
       - name: 应用千寻品牌化
+        if: steps.decide.outputs.build == 'true'
         run: node "$GITHUB_WORKSPACE/.branding-src/branding/apply.mjs"
 
-      - name: 追加 Windows 免安装 zip 目标
-        if: inputs.desktop_zip
+      # 这一步任何构建都要跑：即使不要免安装 zip，产物文件名也必须转成 ASCII。
+      - name: 追加 zip 目标与 ASCII 产物名
+        if: steps.decide.outputs.build == 'true'
+        env:
+          WIN_PATCH_ADD_ZIP: ${{ env.EFF_DESKTOP_ZIP == 'true' && '1' || '0' }}
         run: node "$GITHUB_WORKSPACE/.branding-src/branding/patch-win-target.mjs"
 
       - name: 安装 Node 24.14.0
+        if: steps.decide.outputs.build == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "24.14.0"
 
       - name: 安装 pnpm 10.33.2
+        if: steps.decide.outputs.build == 'true'
         run: |
           set -euo pipefail
           npm install -g pnpm@10.33.2
@@ -165,6 +228,7 @@ jobs:
       # 2) esbuild / electron 的 postinstall 会 spawn 刚解包出来的 node.exe，Windows 上偶发
       #    EBUSY（实时扫描或索引锁住文件）。属瞬时故障，重试可自愈，故做 3 次退避重试。
       - name: 安装依赖
+        if: steps.decide.outputs.build == 'true'
         run: |
           set -uo pipefail
 
@@ -195,6 +259,7 @@ jobs:
       # 这里做一次快速预检：5 秒内暴露缓存缺失 / 权限问题，
       # 而不是等 electron-builder 跑完十几分钟的打包后才在解压阶段报错。
       - name: 预检 electron-builder 缓存
+        if: steps.decide.outputs.build == 'true'
         run: |
           set -euo pipefail
           if [ -z "${ELECTRON_BUILDER_CACHE:-}" ]; then
@@ -224,6 +289,7 @@ jobs:
           [ "$missing" -eq 0 ]
 
       - name: 打包 Windows 桌面安装包
+        if: steps.decide.outputs.build == 'true'
         run: |
           set -euo pipefail
           # bundle.mjs 内部其实也会跑 `pnpm build`（根脚本 = pnpm -r build 全量递归），
@@ -236,6 +302,7 @@ jobs:
           pnpm bundle:desktop -- --os win --arch x64
 
       - name: 校验产物
+        if: steps.decide.outputs.build == 'true'
         run: |
           set -euo pipefail
           cd packages/desktop/dist
@@ -247,8 +314,17 @@ jobs:
             exit 1
           fi
           echo "安装程序: ${installers[*]}"
+          # 产物名必须是纯 ASCII（branding/patch-win-target.mjs 的责任）。
+          # 非 ASCII 会被 GitHub Release 剥离，导致 latest.yml 的 url 与资产名失配。
+          for f in *; do
+            if ! printf '%s' "$f" | LC_ALL=C grep -q '^[ -~]*$'; then
+              echo "::error::产物文件名含非 ASCII 字符: $f（branding/patch-win-target.mjs 可能未生效）"
+              exit 1
+            fi
+          done
 
       - name: 上传产物
+        if: steps.decide.outputs.build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: zcode-win-x64-${{ steps.upstream.outputs.short }}-run${{ github.run_number }}
@@ -262,31 +338,86 @@ jobs:
           retention-days: 14
 
       - name: 发布 Release
-        if: inputs.publish_release
+        if: steps.decide.outputs.build == 'true' && env.EFF_PUBLISH == 'true'
         env:
           # 只在真正需要写 Release 的这一步注入 token。
           # 不要提到 job 级：pnpm install 会执行第三方 postinstall 脚本，
           # 让它们拿到 write 权限的 token 是没必要的暴露面。
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: win-${{ steps.upstream.outputs.short }}
-          RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ inputs.backend_env }})
+          RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ env.EFF_BACKEND_ENV }})
           RELEASE_NOTES: |
             自动构建 [ci skip]
 
             - 上游：zai-org/ZCode@${{ steps.upstream.outputs.short }}，品牌化：千寻（qianxun.io）
-            - 后端环境：${{ inputs.backend_env }}
-            - 产物：NSIS 安装程序${{ inputs.desktop_zip && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
+            - 后端环境：${{ env.EFF_BACKEND_ENV }}
+            - 产物：NSIS 安装程序${{ env.EFF_DESKTOP_ZIP == 'true' && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
             - runner：self-hosted Windows x64
           DIST_DIR: src/packages/desktop/dist
         run: |
           set -euo pipefail
+          # 先把上游提交对象与 tag 一起推到 fork（不经过 main、不触碰 workflow 文件），
+          # 让 win-<short> tag 精确指向本次构建的上游提交，而不是 fork main 的 HEAD。
+          # 这一步同时也是「已构建过」判定的标记来源。
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" \
+            "HEAD:refs/tags/win-${{ steps.upstream.outputs.short }}"
           node "$GITHUB_WORKSPACE/.branding-src/branding/publish-win-release.mjs"
+
+      # 把包投递到本机共享目录并写「待装标记」。
+      #
+      # 为什么不在 job 里直接静默安装：runner 以 NETWORK SERVICE 常驻（Session 0），
+      # 而 electron-builder 的 Windows 安装器是 per-user 安装（装到 %LOCALAPPDATA%\Programs\千寻）。
+      # 由服务账户执行会把包装进 C:\Windows\ServiceProfiles\NetworkService\...，用户根本看不到。
+      # 所以这里只负责投递，真正的安装交给用户会话里的计划任务（install-pending.ps1）。
+      - name: 投递到本机安装区
+        if: steps.decide.outputs.build == 'true'
+        env:
+          DELIVERY_DIR_WIN: G:/zcode-win-dist
+        run: |
+          set -euo pipefail
+          DELIVER_DIR=$(cygpath -u "$DELIVERY_DIR_WIN" 2>/dev/null || printf '%s' "$DELIVERY_DIR_WIN")
+          mkdir -p "$DELIVER_DIR"
+
+          # 先撤掉待装标记：避免安装代理在复制途中的半截状态上下手
+          rm -f "$DELIVER_DIR/install-pending.json"
+          rm -f "$DELIVER_DIR"/*.exe "$DELIVER_DIR"/*.zip "$DELIVER_DIR"/*.blockmap "$DELIVER_DIR"/latest.yml
+
+          cp packages/desktop/dist/*.exe "$DELIVER_DIR/"
+          cp packages/desktop/dist/*.zip "$DELIVER_DIR/" 2>/dev/null || true
+          cp packages/desktop/dist/*.blockmap "$DELIVER_DIR/" 2>/dev/null || true
+          cp packages/desktop/dist/latest.yml "$DELIVER_DIR/" 2>/dev/null || true
+
+          INSTALLER_NAME=$(basename "$(ls "$DELIVER_DIR"/*.exe | head -1)")
+          VERSION=$(printf '%s' "$INSTALLER_NAME" | sed -E 's/^Qianxun-(.*)-win-x64(_TEST)?\.exe$/\1/')
+
+          # 待装标记是「投递完成」的唯一信号，必须最后写。
+          cat > "$DELIVER_DIR/install-pending.json" <<JSON
+          {
+            "installer": "$DELIVERY_DIR_WIN/$INSTALLER_NAME",
+            "version": "$VERSION",
+            "upstreamSha": "${{ steps.upstream.outputs.short }}",
+            "backendEnv": "$ZCODE_ENV",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+
+          ls -lh "$DELIVER_DIR"
+          echo "待装标记:"
+          cat "$DELIVER_DIR/install-pending.json"
+
+      - name: 清理构建产物（节省磁盘）
+        if: always() && steps.decide.outputs.build == 'true'
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/src/packages/desktop/dist" "$GITHUB_WORKSPACE/.branding-src"
+          echo "已清理 dist 与 .branding-src"
 
       - name: 汇总
         if: always()
         run: |
-          echo "上游 ref   = ${{ steps.upstream.outputs.short }}"
-          echo "后端环境   = ${{ inputs.backend_env }}"
-          echo "免安装 zip = ${{ inputs.desktop_zip }}"
-          echo "发布 Release = ${{ inputs.publish_release }}"
-          ls -lh packages/desktop/dist 2>/dev/null || echo "dist 不存在（构建未走到打包阶段）"
+          echo "上游 ref     = ${{ steps.upstream.outputs.short }}"
+          echo "是否构建     = ${{ steps.decide.outputs.build }}"
+          echo "后端环境     = ${{ env.EFF_BACKEND_ENV }}"
+          echo "免安装 zip   = ${{ env.EFF_DESKTOP_ZIP }}"
+          echo "发布 Release = ${{ env.EFF_PUBLISH }}"
+          ls -lh packages/desktop/dist 2>/dev/null || echo "dist 已清理或未生成"
