@@ -16,7 +16,7 @@
  *   DIST_DIR           可选，默认 packages/desktop/dist
  *   ASSET_PATTERN      可选，默认 *.exe,*.zip,*.blockmap,latest.yml
  */
-import { createReadStream, existsSync, readdirSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { basename, resolve } from "node:path";
 
@@ -98,9 +98,38 @@ function matches(name, pattern) {
 }
 
 // 3) 逐个上传（同名资产先删再传，保证 --clobber 语义）
+//
+// 上传必须带显式 Content-Length：GitHub 的 uploads 端点会拒收
+// transfer-encoding: chunked 的请求，报 400 `{"message":"Bad Content-Length"}`。
+// 而 Node 原生 fetch（undici）只要 body 是流、且 headers 里没有 Content-Length，
+// 就会自动改走 chunked —— 这正是本步骤早先失败的根因。
+// 所以这里显式写死 Content-Length；万一 undici 与流的协作还有意外，
+// 退化为整块读入内存再传（fetch 会自己算长度，最大产物约 200 MiB，代价可接受）。
 const existing = (await api("GET", `/repos/${repo}/releases/${release.id}/assets?per_page=100`))
   .data;
 const existingByName = new Map((existing || []).map((asset) => [asset.name, asset.id]));
+
+async function uploadAsset(assetPath, uploadUrl, name) {
+  const baseHeaders = { ...headers, "Content-Type": "application/octet-stream" };
+  const size = statSync(assetPath).size;
+
+  const streamed = await fetch(uploadUrl, {
+    method: "POST",
+    headers: { ...baseHeaders, "Content-Length": String(size) },
+    // 大安装包不整块读进内存，直接流式上传。
+    body: Readable.toWeb(createReadStream(assetPath)),
+    duplex: "half",
+  });
+  if (streamed.ok) return streamed;
+
+  const reason = `${streamed.status}: ${await streamed.text()}`;
+  console.warn(`  流式上传失败（${reason}），改用整块上传重试 ${name}`);
+  return fetch(uploadUrl, {
+    method: "POST",
+    headers: baseHeaders,
+    body: readFileSync(assetPath),
+  });
+}
 
 for (const assetPath of assets) {
   const name = basename(assetPath);
@@ -113,15 +142,10 @@ for (const assetPath of assets) {
   }
 
   console.log(`上传 ${name} (${sizeMb} MiB)...`);
-  const response = await fetch(
+  const response = await uploadAsset(
+    assetPath,
     `${uploadBase}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`,
-    {
-      method: "POST",
-      headers: { ...headers, "Content-Type": "application/octet-stream" },
-      // 大安装包不整块读进内存，直接流式上传。
-      body: Readable.toWeb(createReadStream(assetPath)),
-      duplex: "half",
-    },
+    name,
   );
 
   if (!response.ok) {

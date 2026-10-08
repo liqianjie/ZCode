@@ -365,6 +365,16 @@ jobs:
           cp packages/desktop/dist/*.blockmap "$DELIVER_DIR/" 2>/dev/null || true
           cp packages/desktop/dist/latest.yml "$DELIVER_DIR/" 2>/dev/null || true
 
+          # 顺带把安装代理脚本同步到投递目录，避免「仓库改了、机器上还是旧脚本」的漂移
+          # （踩过：修好探测逻辑后机器上仍在跑旧脚本，必须手工 Copy-Item 才生效）。
+          # 代理在启动时就把整个脚本读进内存，覆盖文件不会影响正在运行的实例；
+          # 新脚本会在下次登录 / 任务重启时生效。失败不阻断投递。
+          if [ -f "$GITHUB_WORKSPACE/.branding-src/branding/win-autoinstall.ps1" ]; then
+            cp "$GITHUB_WORKSPACE/.branding-src/branding/win-autoinstall.ps1" "$DELIVER_DIR/win-autoinstall.ps1" \
+              && echo "已同步 win-autoinstall.ps1" \
+              || echo "::warning::同步 win-autoinstall.ps1 失败（本次投递继续）"
+          fi
+
           INSTALLER_NAME=$(basename "$(ls "$DELIVER_DIR"/*.exe | head -1)")
           VERSION=$(printf '%s' "$INSTALLER_NAME" | sed -E 's/^Qianxun-(.*)-win-x64(_TEST)?\.exe$/\1/')
 

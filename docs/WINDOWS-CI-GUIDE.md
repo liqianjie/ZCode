@@ -391,6 +391,19 @@ dubious ownership 并直接 `exit 128`。`actions/checkout` 只在自己的临�
 **本机照样能拿到并装上包**，只是 Releases 页面没有对应资产。
 反过来如果投递失败，发布仍会继续 —— 看 run 的步骤结论区分是哪一环。
 
+**发布失败：`上传 xxx 失败 400: {"message":"Bad Content-Length"}`**
+GitHub 的 `uploads.github.com` 端点**拒收 `transfer-encoding: chunked`** 的请求。
+Node 原生 `fetch`（undici）只要 body 是流、且 headers 里没写 `Content-Length`，
+就会自动改走 chunked —— 于是必然 400。
+发布脚本已显式带上 `Content-Length`（取 `statSync().size`），并保留一条
+「整块 Buffer 上传」的兜底路径。本地对照实测：
+
+| 写法 | 结果 |
+| --- | --- |
+| 流式 + 不设 Content-Length | `FAIL 400 Bad Content-Length` |
+| 流式 + 显式 Content-Length | `PASS 201` |
+| 整块 Buffer | `PASS 201` |
+
 **Release 建出来了但是空的（没有任何资产）**
 去重标记 `win-<short>` 必须在创建 Release **之前**推上去（否则 Release 的 tag 会被
 GitHub 建在 fork main 的 HEAD，指不到本次构建的上游提交），于是存在一个窗口：
