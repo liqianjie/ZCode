@@ -42,7 +42,8 @@ fork 的 main 分支不合并上游、只承载 `branding/` 与 CI 定义，上�
 这与已有的 macOS 流水线 `zcode-autoupdate.yml` 保持同一套思路。
 
 **为什么安装要多绕一层**：runner 以 `NETWORK SERVICE` 服务账户常驻（Session 0），
-而 electron-builder 的 Windows 安装器是**按用户安装**（装到 `%LOCALAPPDATA%\Programs\千寻`）。
+而 electron-builder 的 Windows 安装器是**按用户安装**（装到 `%LOCALAPPDATA%\Programs\@zcodedesktop`，
+目录名取自清洗后的 `package.json` name，见第 6 节）。
 若由服务账户执行安装，包会被装进 `C:\Windows\ServiceProfiles\NetworkService\...`，
 登录用户根本看不到。所以 workflow 只负责投递，真正的安装交给用户会话里的计划任务。
 详见第 5 节。
@@ -74,7 +75,25 @@ fork 的 main 分支不合并上游、只承载 `branding/` 与 CI 定义，上�
 页面里的 `./config.cmd --url ... --token XXXX` 中那串 `XXXX` 就是注册令牌。
 **令牌 1 小时过期**，过期后重新打开该页面取新的即可。
 
-runner 安装包已下载并解压到 `G:\actions-runner-zcode-win`（v2.338.0，SHA256 已核对官方校验值）。
+runner 安装包已下载并解压到 `G:\actions-runner\zcode-win`（v2.338.0，SHA256 已核对官方校验值）。
+
+**目录约定**：本机所有 self-hosted runner 统一放在 `G:\actions-runner\` 下，一个仓库一个子目录：
+
+```
+G:\actions-runner\
+├── zcode-win\      # liqianjie/ZCode    labels: zcode-win
+└── qianxun-win\    # liqianjie/qianxun  labels: qianxun-win
+```
+
+不要散落在盘根（早期用过 `G:\actions-runner-zcode-win`，已迁移）。目录必须固定，有两个硬理由：
+一是 iOA 的白名单按路径授权，路径一变就得重新放行（见 3.5）；
+二是同盘迁移只是改目录项、秒级完成，跨盘才需要真的拷数据。
+
+> **迁移已有 runner**：停服务 → 删服务（`Get-CimInstance Win32_Service` + `Invoke-CimMethod Delete`，
+> 不要用被 iOA 拉黑的 `sc.exe`）→ `Move-Item` 目录 → 删掉 `.runner`/`.credentials`/`.credentials_rsaparams`
+> → 在新路径重跑 `configure --replace`。
+> `--replace` 只替换 GitHub 侧同名 runner（`agentId` 会复用），**不能覆盖本地已有配置** ——
+> 不清掉 `.runner` 会直接报 `Cannot configure the runner because it is already configured`。
 
 > 版本说明：v2.338.0 的 Windows 包**没有 `svc.cmd`**，只有 `config.cmd` / `run.cmd`。
 > 服务安装必须通过 `config.cmd --runasservice`，不要再照抄老教程里的 `.\svc.cmd install`。
@@ -85,7 +104,7 @@ runner 安装包已下载并解压到 `G:\actions-runner-zcode-win`（v2.338.0�
 需要输入 Windows 登录密码（会存进 Windows LSA，改密码后需重装服务）。
 
 ```powershell
-cd G:\actions-runner-zcode-win
+cd G:\actions-runner\zcode-win
 .\config.cmd --url https://github.com/liqianjie/ZCode --token <TOKEN> `
   --name zcode-win-01 --labels zcode-win --work _work --replace `
   --runasservice --windowslogonaccount "QIANJIELI-PC2\qianjieli"
@@ -96,7 +115,7 @@ cd G:\actions-runner-zcode-win
 ### 3.3 配置 —— 方式 B：以默认服务账户运行（免密码）
 
 ```powershell
-cd G:\actions-runner-zcode-win
+cd G:\actions-runner\zcode-win
 .\config.cmd --url https://github.com/liqianjie/ZCode --token <TOKEN> `
   --name zcode-win-01 --labels zcode-win --work _work --replace `
   --runasservice --unattended --windowslogonaccount 'NT AUTHORITY\NETWORK SERVICE'
@@ -108,7 +127,7 @@ cd G:\actions-runner-zcode-win
   runner 程序也没有 Git 位置的兜底查找。workflow 已改用绝对路径的 shell 模板
   （`C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}`）。
 - **electron-builder 解压 `winCodeSign` 必失败**：服务账户没有创建符号链接的特权。
-  必须预置共享缓存，见第 5 节。
+  必须预置共享缓存，见第 6 节。
 - **electron-builder 缓存另起一份**：`%LOCALAPPDATA%` 落在
   `C:\Windows\ServiceProfiles\NetworkService\AppData\Local`。
   pnpm store 不受影响 —— 它按**项目所在盘符**定位（`G:\.pnpm-store\v10`），不跟用户走，
@@ -120,7 +139,7 @@ cd G:\actions-runner-zcode-win
 
 ```powershell
 # runner 是否在线
-cd G:\actions-runner-zcode-win
+cd G:\actions-runner\zcode-win
 .\run.cmd --check
 # 或直接看 GitHub 页面：Settings -> Actions -> Runners
 ```
@@ -133,7 +152,41 @@ Get-CimInstance Win32_Service | Where-Object { $_.Name -like 'actions.runner*' }
   Format-List Name, StartName, State, PathName
 ```
 
-必要时应能看到 `runs-on` 匹配的 label：`self-hosted`、`windows`、`x64`、`zcode-win`。
+必要时应能看到 `runs-on` 匹配的 label：`self-hosted`、`Windows`、`X64`、`zcode-win`
+（GitHub 自动追加前三个，大小写严格区分，写错 job 会一直排队等不到 runner）。
+
+### 3.5 iOA 放行清单（本机必做）
+
+本机装了腾讯 iOA 终端管控（`C:\Program Files (x86)\iOA`），它会拦 runner 的进程与网络行为。
+**未放行时 runner 的表现很有迷惑性**：
+
+| 现象 | 说明 |
+| --- | --- |
+| Windows 服务 `Running` | 服务确实起来了 |
+| GitHub 侧一直 `offline` | 但连不上 GitHub，登录失败 |
+| `_diag\Runner_<ts>-utc.log` 为 **0 字节** | 服务进程卡在启动阶段，一条日志都没写成 |
+| 交互会话里手跑 `Runner.Listener.exe --check` 能过 | 你的会话已授权、服务账户还没有 —— 这是关键区分点 |
+
+所以判断标准不是"服务在不在跑"，而是**服务进程有没有写出日志**。
+
+按**目录**放行下面这些路径（逐 exe 放行一定会漏 —— 构建时会拉起 Node、pnpm、7-Zip、Electron 一串进程）：
+
+| 路径 | 用途 |
+| --- | --- |
+| `G:\actions-runner\` | runner 本体（Listener / Worker / Service）+ `_work` 下的 Node 工具链 |
+| `G:\electron-builder-cache\` | 缓存里的 `7za.exe` 等解压工具 |
+| `G:\.pnpm-store\` | pnpm store，构建期间被大量调用 |
+| `G:\zcode-win-dist\` | 安装包投递目录（写产物与待装标记） |
+| `C:\Program Files\Git\bin\bash.exe` | workflow 的 shell，runner 以绝对路径调用 |
+
+放行后重启服务让规则生效：
+
+```powershell
+Restart-Service 'actions.runner.liqianjie-ZCode.zcode-win-01'
+Restart-Service 'actions.runner.liqianjie-qianxun.qianxun-win-x64'
+```
+
+验证：GitHub 侧 30 秒内转 `online`，且 `_diag` 里出现**非 0 字节**的新日志。
 
 ---
 
@@ -365,7 +418,7 @@ tag 就是去重标记，删掉就会重打一次。真要强制重建，手动�
 如果构建是绿的却仍出现这种名字，去看 `追加 zip 目标与 ASCII 产物名` 这一步是否被跳过。
 
 **装了新版本但界面还是旧的**
-先确认实际版本：`%LOCALAPPDATA%\Programs\千寻\千寻.exe` 右键 → 属性 → 详细信息 → 产品版本。
+先确认实际版本：`%LOCALAPPDATA%\Programs\@zcodedesktop\千寻.exe` 右键 → 属性 → 详细信息 → 产品版本。
 若版本已是新的，多半还有旧实例在跑（托盘没退干净），完全退出后重新打开。
 
 **发布 Release 失败：`fatal: detected dubious ownership in repository`**
@@ -427,7 +480,7 @@ workflow 已加 `发布失败时回滚去重标记` 步骤收口：只在本次�
 # runner 会自动更新自身；如需手动更新，重跑下载解压流程覆盖即可
 
 # 停止并卸载服务（先停服务再注销 runner）
-cd G:\actions-runner-zcode-win
+cd G:\actions-runner\zcode-win
 .\config.cmd remove --token <新令牌>
 
 # 也可以直接走服务管理
