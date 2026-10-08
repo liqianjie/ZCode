@@ -5,32 +5,47 @@
 放在自有机器上可以长期复用 pnpm store 与 electron 缓存，也不消耗托管 runner 额度。
 
 - 流水线定义：[`.github/workflows/zcode-win-build.yml`](../.github/workflows/zcode-win-build.yml)
-- fork 侧补丁：`branding/apply.mjs`（品牌化）、`branding/patch-win-target.mjs`（追加 zip 目标）、
-  `branding/publish-win-release.mjs`（发布 Release）
+- fork 侧补丁：`branding/apply.mjs`（品牌化）、`branding/patch-win-target.mjs`（追加 zip 目标 + ASCII 产物名）、
+  `branding/publish-win-release.mjs`（发布 Release + 清理历史 Release）、
+  `branding/win-autoinstall.ps1`（本机静默安装代理）
 
 ---
 
 ## 1. 架构与流程
 
 ```
-workflow_dispatch（手动触发）
-        │
-        ▼
-self-hosted Windows runner（label: zcode-win）
-        │
-        ├─ 1. 检出上游 zai-org/ZCode（指定 ref，默认 main 最新提交）
-        ├─ 2. 检出本 fork main 的 branding/ 补丁
-        ├─ 3. 应用千寻品牌化 → productName/appId/图标/Web 标题
-        ├─ 4. 追加 Windows zip 目标 → win.target = ["nsis", "zip"]
-        ├─ 5. Node 24.14.0 + pnpm 10.33.2
-        ├─ 6. pnpm install --frozen-lockfile
-        ├─ 7. pnpm bundle:desktop -- --os win --arch x64
-        └─ 8. 上传产物（可选：创建 GitHub Release）
+schedule 每天 09:30（北京）              workflow_dispatch（手动）
+        │                                        │
+        └────────────────┬───────────────────────┘
+                         ▼
+        self-hosted Windows runner（label: zcode-win）
+                         │
+                         ├─ 1. 解析上游 ref
+                         ├─ 2. 该上游提交是否已发过 Release？（看 tag win-<sha>）
+                         │        └─ 是 → 直接结束，不空跑一遍打包
+                         ├─ 3. 检出上游 zai-org/ZCode
+                         ├─ 4. 检出本 fork main 的 branding/ 补丁
+                         ├─ 5. 应用千寻品牌化 → productName/appId/图标/Web 标题
+                         ├─ 6. 追加 Windows zip 目标 + 产物名转 ASCII
+                         ├─ 7. Node 24.14.0 + pnpm 10.33.2 → pnpm install
+                         ├─ 8. pnpm build && pnpm bundle:desktop -- --os win --arch x64
+                         ├─ 9. 上传产物 / 推 tag + 发 Release / 清理历史 Release
+                         └─10. 投递到 G:\zcode-win-dist + 写 install-pending.json
+                                        │
+                                        ▼
+                用户会话内的计划任务 ZCode-Qianxun-AutoInstall
+                     （轮询待装标记 → 应用未运行 → 静默安装）
 ```
 
 关键点：**打包源码来自上游 `zai-org/ZCode`，不是本 fork**。
 fork 的 main 分支不合并上游、只承载 `branding/` 与 CI 定义，上游更新自动生效。
 这与已有的 macOS 流水线 `zcode-autoupdate.yml` 保持同一套思路。
+
+**为什么安装要多绕一层**：runner 以 `NETWORK SERVICE` 服务账户常驻（Session 0），
+而 electron-builder 的 Windows 安装器是**按用户安装**（装到 `%LOCALAPPDATA%\Programs\千寻`）。
+若由服务账户执行安装，包会被装进 `C:\Windows\ServiceProfiles\NetworkService\...`，
+登录用户根本看不到。所以 workflow 只负责投递，真正的安装交给用户会话里的计划任务。
+详见第 5 节。
 
 ---
 
@@ -124,37 +139,122 @@ Get-CimInstance Win32_Service | Where-Object { $_.Name -like 'actions.runner*' }
 
 ## 4. 跑流水线
 
+### 4.1 自动：每天 09:30
+
+`schedule: 30 1 * * *`（01:30 UTC = 北京时间 09:30，与 macOS 流水线同一时刻）。
+
+- 上游 main 没有新提交、或该提交已发过 Release（tag `win-<short_sha>` 存在）→ **几秒内跳过**，不空跑一遍打包。
+- 有新提交 → 出 **production 正式包** → 发 Release → 投递到本机安装区。
+- 机器没开机时 job 会在 GitHub 侧排队（队列上限 24 小时），**开机后 runner 一上线立刻开跑**，不会丢任务。
+
+> 去重标记用的是 Release tag `win-<short_sha>`：发布时会把上游提交对象连同 tag 一起推到 fork，
+> 所以 tag 精确指向被构建的那个上游 commit（而不是 fork main 的 HEAD）。
+> 清理历史 Release 时**只删 Release、保留 tag**，否则同一个提交会被反复重打包。
+
+> 已知限制：GitHub 会在**仓库连续 60 天无活动**时自动停用定时 workflow。
+> 定时构建本身会产出 Release（属于仓库活动），所以只要上游还在更新就不会触发；
+> 若哪天发现定时不再触发，去 Actions 页面把 `zcode-win-build` 重新 Enable 即可。
+
+### 4.2 手动：workflow_dispatch
+
 1. 打开 <https://github.com/liqianjie/ZCode/actions/workflows/zcode-win-build.yml>
 2. 点 **Run workflow**，按需填参数：
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `upstream_ref` | 空 | 留空 = `zai-org/ZCode` main 最新提交；可填分支/tag/commit sha |
-| `backend_env` | `test` | `test` → 千寻 + `_TEST` 后缀；`production` → 千寻 + 无后缀（连生产后端） |
+| `force_build` | `false` | 即使该上游提交已发过 Release 也强制重新构建 |
+| `upstream_ref` | 空 | 留空 = `zai-org/ZCode` main 最新提交；可填分支 / tag / commit sha |
+| `backend_env` | `production` | `production` → 无后缀（连生产后端）；`test` → 带 `_TEST`（连测试后端） |
 | `desktop_zip` | `true` | 是否额外产出免安装 zip |
-| `publish_release` | `false` | 构建成功后创建/更新 Release（tag: `win-<short_sha>`） |
+| `publish_release` | `true` | 构建成功后推 tag + 创建/更新 Release |
 
-3. 产物在 **Actions → 该次 run → Artifacts** 里下载（保留 14 天）。
+3. 产物在 **Actions → 该次 run → Artifacts** 里下载（保留 14 天），
+   同时也会发到 Releases 并投递到本机安装区。
 
-### 产物命名规则
+### 4.3 产物命名规则
 
-由 `packages/desktop/electron-builder.config.js` 的 `buildDesktopArtifactName` 决定：
+由 `branding/patch-win-target.mjs` 覆写上游的 `win.artifactName`，**固定为纯 ASCII**：
 
 ```
-${productName}-${version}-win-x64${_TEST}.{ext}
+Qianxun-${version}-win-x64${_TEST}.${ext}
 ```
 
 | 场景 | 安装程序 | 免安装包 |
 | --- | --- | --- |
-| `backend_env=test`（默认） | `千寻-3.14.3-win-x64_TEST.exe` | `千寻-3.14.3-win-x64_TEST.zip` |
-| `backend_env=production` | `千寻-3.14.3-win-x64.exe` | `千寻-3.14.3-win-x64.zip` |
+| `backend_env=production` | `Qianxun-3.14.3-win-x64.exe` | `Qianxun-3.14.3-win-x64.zip` |
+| `backend_env=test` | `Qianxun-3.14.3-win-x64_TEST.exe` | `Qianxun-3.14.3-win-x64_TEST.zip` |
 
-`_TEST` 标记的是**后端环境**，不是身份；身份始终是「千寻」。
-两个环境产物文件名不同，便于人工验收时区分。
+两个约定：
+
+- `_TEST` 标记的是**后端环境**，不是身份；安装后的应用名始终是「千寻」。
+- 文件名必须是 ASCII。上游用 `${productName}` 拼名字，而 fork 的 productName 是「千寻」，
+  GitHub Release 会**剥离资产名里的非 ASCII 字符**（`千寻-3.14.3-win-x64.exe` → `-3.14.3-win-x64.exe`），
+  导致 `latest.yml` 里的 url 与实际上传的资产名失配。
+  workflow 的校验步骤会显式拦截含非 ASCII 的产物名，避免悄悄发出去。
+
+### 4.4 Release 保留策略
+
+每有一个新上游提交就发一个 Release（约 350 MB 产物），不清理会无限堆积。
+发布脚本默认只保留**最近 3 个** `win-*` Release，更旧的删掉 Release 记录与资产
+（可用 `KEEP_WIN_RELEASES` 环境变量调整）。`auto-*`（macOS 流水线的）一概不碰。
 
 ---
 
-## 5. 常见问题
+## 5. 自动安装到本机
+
+workflow 的最后一步把安装包投递到 `G:\zcode-win-dist\`，并写一份待装标记：
+
+```
+G:\zcode-win-dist\
+├── Qianxun-3.14.3-win-x64.exe      # NSIS 安装程序
+├── Qianxun-3.14.3-win-x64.zip      # 免安装绿色包
+├── latest.yml                      # electron-updater 清单
+├── install-pending.json            # 待装标记（投递完成的唯一信号）
+├── install-failed.json             # 连续失败 3 次后的归档（如有）
+├── win-autoinstall.ps1             # 安装代理（脚本本体也在仓库 branding/ 下）
+└── autoinstall.log                 # 代理日志
+```
+
+真正的安装由计划任务 **`ZCode-Qianxun-AutoInstall`** 在**你的用户会话**里完成：
+
+| 项 | 值 |
+| --- | --- |
+| 触发器 | 登录时（延迟 1 分钟） |
+| 运行身份 | 当前用户 `qianjieli`，`LogonType = Interactive`（不需要密码） |
+| 动作 | `powershell.exe -File G:\zcode-win-dist\win-autoinstall.ps1`（常驻） |
+| 行为 | 每 60 秒检查待装标记 → 确认应用未运行 → `安装程序.exe /S` → 校验版本 → 删除标记 |
+
+日常查看与操作：
+
+```powershell
+Get-ScheduledTask -TaskName "ZCode-Qianxun-AutoInstall" | Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName "ZCode-Qianxun-AutoInstall" | Select-Object LastRunTime, LastTaskResult
+Start-ScheduledTask -TaskName "ZCode-Qianxun-AutoInstall"                 # 手工拉起代理
+Get-Content "G:\zcode-win-dist\autoinstall.log" -Encoding UTF8 -Tail 30   # 看代理都做了什么
+```
+
+行为约定：
+
+- **应用运行中不覆盖安装**。NSIS 覆盖运行中的程序会失败或留下半装状态，
+  代理会等到应用退出后再装 —— 也就是说你开着千寻时，新版本要等你关掉它才装上。
+- **装完不自动拉起应用**，避免打断你手头的事；自己点快捷方式即可用上新版本。
+- **同一版本只装一次**：代理会比对 `%LOCALAPPDATA%\Programs\千寻\千寻.exe` 的版本号。
+- **失败最多重试 3 次**，仍失败就把标记归档为 `install-failed.json`，等下一次投递，避免死循环。
+
+### 时间线（每天 09:30 触发，构建约 11 分钟）
+
+| 你的动作 | 结果 |
+| --- | --- |
+| 09:30 前已开机（runner 在线） | 09:30 触发 → 约 09:41 装好 |
+| 09:00 才开机 | runner 09:00 上线、job 尚未触发；09:30 触发 → 约 09:41 装好 |
+| 10:30 才开机 | job 在 GitHub 侧排队等着；开机 → 立刻开跑 → 约 11 分钟后装好 |
+
+> 代理是**常驻**的（每 60 秒轮询一次，几乎不占资源），所以你几点开机都不会错过投递 ——
+> 这也是为什么它不做「只轮询 N 分钟就退出」的优化。
+
+---
+
+## 6. 常见问题
 
 **产物里少了 zip**
 `patch-win-target.mjs` 会用锚点校验上游的 `win.target`。上游一旦改动该处，
@@ -226,14 +326,36 @@ find /g/electron-builder-cache -type l | wc -l
 把上游 checkout 步骤加 `clean: false` 可跳过清理，重复构建时省下依赖安装时间。
 代价是上游改了 `pnpm-lock.yaml` 时可能残留旧依赖 —— 排查构建异常时建议改回 `clean: true`。
 
+**定时构建每次都「跳过构建」**
+先看 run 日志前几步。`检查该上游提交是否已构建过` 命中 tag `win-<short_sha>` 时会置 `build=false`，
+这是预期行为（上游没有新提交）。若上游确实有新提交却仍跳过，检查该 tag 是否被人为删除 ——
+tag 就是去重标记，删掉就会重打一次。真要强制重建，手动触发时勾上 `force_build`。
+
+**包投递了但没自动安装**
+按顺序排查：
+1. 计划任务是否在跑：`Get-ScheduledTask -TaskName "ZCode-Qianxun-AutoInstall"` 应为 `Running`；
+   不在就跑 `Start-ScheduledTask -TaskName "ZCode-Qianxun-AutoInstall"`。
+2. 千寻是否正开着：代理**不会**在应用运行时覆盖安装，关掉应用后它会自己继续。
+3. 看 `G:\zcode-win-dist\autoinstall.log`，代理每一步都有日志。
+4. 若目录里出现 `install-failed.json`，说明连续装失败 3 次，看日志里的退出码与版本校验结果。
+
+**Release 资产名变成 `-3.14.3-win-x64.exe`（丢了前缀）**
+这是 GitHub 剥离中文资产名的结果，说明 `patch-win-target.mjs` 的 ASCII 改名没生效。
+该脚本用锚点校验上游的 `win.artifactName`，上游一改就会抛错中断构建；
+如果构建是绿的却仍出现这种名字，去看 `追加 zip 目标与 ASCII 产物名` 这一步是否被跳过。
+
+**装了新版本但界面还是旧的**
+先确认实际版本：`%LOCALAPPDATA%\Programs\千寻\千寻.exe` 右键 → 属性 → 详细信息 → 产品版本。
+若版本已是新的，多半还有旧实例在跑（托盘没退干净），完全退出后重新打开。
+
 **⚠️ 安全红线**
 本仓库是 public。self-hosted runner **绝不可**对 `pull_request` / `pull_request_target` 开放，
 否则任何 fork 的 PR 都能在打包机上执行任意代码（读写本机文件、借 runner 身份访问内网）。
-本流水线只保留 `workflow_dispatch`，不要为了图方便加 PR 触发。
+本流水线只保留 `schedule` 与 `workflow_dispatch`，不要为了图方便加 PR 触发。
 
 ---
 
-## 6. 更新与卸载
+## 7. 更新与卸载
 
 ```powershell
 # runner 会自动更新自身；如需手动更新，重跑下载解压流程覆盖即可
@@ -246,11 +368,15 @@ cd G:\actions-runner-zcode-win
 Stop-Service 'actions.runner.liqianjie-ZCode.zcode-win-01'
 ```
 
-## 7. 本地不开 CI 时的手动打包
+## 8. 本地不开 CI 时的手动打包
 
 ```bash
 cd <ZCode 检出目录>
 pnpm install --frozen-lockfile
-ZCODE_SKIP_REMOTE_ASSETS=1 pnpm bundle:desktop -- --os win --arch x64
-# 产物在 packages/desktop/dist/（NSIS 默认只有一个 .exe；要 zip 先跑 branding/patch-win-target.mjs）
+# 要额外产出免安装 zip、并把产物名转成 ASCII，先跑一遍 Windows 增量补丁
+node branding/patch-win-target.mjs        # 只想要 zip 不要 ASCII 改名：WIN_PATCH_ADD_ZIP=0
+# production 后端务必带上 ZCODE_PREVIEW_IDENTITY=1，否则产物会退回 ZCode 身份
+ZCODE_SKIP_REMOTE_ASSETS=1 ZCODE_ENV=production ZCODE_PREVIEW_IDENTITY=1 \
+  pnpm bundle:desktop -- --os win --arch x64
+# 产物在 packages/desktop/dist/
 ```
