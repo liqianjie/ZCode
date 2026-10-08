@@ -348,6 +348,29 @@ tag 就是去重标记，删掉就会重打一次。真要强制重建，手动�
 先确认实际版本：`%LOCALAPPDATA%\Programs\千寻\千寻.exe` 右键 → 属性 → 详细信息 → 产品版本。
 若版本已是新的，多半还有旧实例在跑（托盘没退干净），完全退出后重新打开。
 
+**发布 Release 失败：`fatal: detected dubious ownership in repository`**
+```
+'G:/actions-runner-zcode-win/_work/ZCode/ZCode/src' is owned by:
+    QIANJIELI-PC2/qianjieli
+but the current user is:
+    NT AUTHORITY/NETWORK SERVICE
+```
+runner 以 `NETWORK SERVICE` 常驻，而工作区目录的属主是交互用户，git 2.35.2+ 会判定为
+dubious ownership 并直接 `exit 128`。`actions/checkout` 只在自己的临时 `HOME` 里放行
+`safe.directory`，后续自定义步骤不受益。
+
+发布步骤已注入 `GIT_CONFIG_COUNT=1` / `GIT_CONFIG_KEY_0=safe.directory` /
+`GIT_CONFIG_VALUE_0=*`，只对本次步骤生效、不写任何持久配置。
+`apps/zcode-cli build` 里那句 `failed to get git status for dirty hash` 是同一个原因，
+只是它以 warning 形式降级，不影响产物。
+
+**投递与发布是解耦的**
+`投递到本机安装区` 排在 `发布 Release` **之前**，守卫是
+`!cancelled() && build == 'true' && steps.verify.conclusion == 'success'`。
+所以发布环节出问题（API 限流、网络抖动、token 权限）时，
+**本机照样能拿到并装上包**，只是 Releases 页面没有对应资产。
+反过来如果投递失败，发布仍会继续 —— 看 run 的步骤结论区分是哪一环。
+
 **⚠️ 安全红线**
 本仓库是 public。self-hosted runner **绝不可**对 `pull_request` / `pull_request_target` 开放，
 否则任何 fork 的 PR 都能在打包机上执行任意代码（读写本机文件、借 runner 身份访问内网）。
