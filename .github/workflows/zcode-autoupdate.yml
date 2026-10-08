@@ -1,0 +1,175 @@
+name: zcode-auto-update
+
+# ZCode 自动更新流水线（fork 专用）
+# 每天 09:30（北京时间）检查上游 zai-org/ZCode，有新提交则：
+# 构建 Preview(TEST) 变体 -> 发布到本 fork Releases -> 安装到本机 /Applications
+# 构建跑在 self-hosted runner（本机，label: zcode-mac），不消耗 GitHub 托管 runner 额度。
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # 01:30 UTC = 北京时间 09:30
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "即使 Release 已存在也强制重新构建并发布"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zcode-auto-update
+  cancel-in-progress: false
+
+env:
+  ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+
+jobs:
+  sync-build-release-install:
+    runs-on: [self-hosted, zcode-mac]
+    timeout-minutes: 90
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      # 无论是否有新版本，先把上次暂存的新版本换入（仅当应用未运行时）
+      - name: 换入暂存的新版本（如应用未运行）
+        run: |
+          set -euo pipefail
+          DEST="/Applications/ZCode Preview.app"
+          PENDING="/Applications/ZCode Preview.pending.app"
+          if [ ! -d "$PENDING" ]; then
+            echo "无暂存版本，跳过"
+            exit 0
+          fi
+          if pgrep -f "ZCode Preview.app" >/dev/null 2>&1; then
+            echo "应用运行中，暂存版本继续等待"
+            exit 0
+          fi
+          PV=$(defaults read "$PENDING/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
+          rm -rf "$DEST.old"
+          if [ -d "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
+          cp -R "$PENDING" "$DEST"
+          rm -rf "$PENDING"
+          xattr -rd com.apple.quarantine "$DEST" 2>/dev/null || true
+          echo "已换入暂存版本 v$PV"
+
+      - name: 检查上游是否有新版本
+        id: check
+        run: |
+          set -euo pipefail
+          UP_SHA=$(git ls-remote https://github.com/zai-org/ZCode.git refs/heads/main | cut -f1)
+          SHORT=$(echo "$UP_SHA" | cut -c1-7)
+          echo "up_sha=$UP_SHA"   >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT" >> "$GITHUB_OUTPUT"
+          if gh release view "auto-$SHORT" -R liqianjie/ZCode >/dev/null 2>&1; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "上游 main = $SHORT，对应 Release 已存在"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "上游 main = $SHORT，发现新版本"
+          fi
+
+      - name: 是否需要构建
+        id: decide
+        run: |
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "${{ steps.check.outputs.exists }}" = "true" ] && [ "$FORCE" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新且已发布，本次不构建"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "开始构建（force_build=$FORCE）"
+          fi
+
+      - name: 检出上游源码
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: zai-org/ZCode
+          ref: ${{ steps.check.outputs.up_sha }}
+
+      - name: 安装 Node 与 pnpm
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+
+      - name: 安装 pnpm
+        if: steps.decide.outputs.build == 'true'
+        run: npm install -g pnpm@10.33.2
+
+      - name: 恢复依赖缓存
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/pnpm/store
+            ~/Library/Caches/electron
+          key: zcode-${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            zcode-${{ runner.os }}-pnpm-
+
+      - name: 安装依赖并打包桌面应用
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm bundle:desktop
+
+      - name: 发布 Release
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          SHORT="${{ steps.check.outputs.short_sha }}"
+          VER=$(node -p "require('./package.json').version")
+          # 把上游提交对象与 tag 推到 fork（不经过 main，不触碰 workflow 文件）
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" "HEAD:refs/tags/auto-$SHORT"
+          cd packages/desktop/dist
+          gh release create "auto-$SHORT" -R liqianjie/ZCode \
+            --title "ZCode Preview v${VER} (${SHORT})" \
+            --notes "自动构建 [ci skip]
+
+          - 上游：zai-org/ZCode@${SHORT}（v${VER}）
+          - 变体：Preview / TEST 后端 / 未签名本地构建（mac arm64）
+          - zip 内含可直接使用的 .app；dmg 为常规安装镜像" \
+            "./ZCode Preview-${VER}-mac-arm64_TEST.zip" \
+            "./ZCode Preview-${VER}-mac-arm64_TEST.dmg"
+          echo "已发布 Release auto-$SHORT（v${VER}）"
+
+      - name: 安装到本机
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/packages/desktop/dist/mac-arm64/ZCode Preview.app"
+          DEST="/Applications/ZCode Preview.app"
+          PENDING="/Applications/ZCode Preview.pending.app"
+          NEW_VER=$(defaults read "$SRC/Contents/Info.plist" CFBundleShortVersionString)
+          if pgrep -f "ZCode Preview.app" >/dev/null 2>&1; then
+            rm -rf "$PENDING"
+            cp -R "$SRC" "$PENDING"
+            osascript -e "display notification \"v${NEW_VER} 已就绪，退出并重新打开 ZCode Preview 后生效\" with title \"ZCode 自动更新\"" 2>/dev/null || true
+            echo "应用运行中：v$NEW_VER 已暂存到 $PENDING，应用退出后自动换入"
+          else
+            rm -rf "$DEST.old"
+            if [ -d "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
+            cp -R "$SRC" "$DEST"
+            rm -rf "$PENDING"
+            xattr -rd com.apple.quarantine "$DEST" 2>/dev/null || true
+            GOT=$(defaults read "$DEST/Contents/Info.plist" CFBundleShortVersionString)
+            if [ "$GOT" != "$NEW_VER" ]; then
+              echo "安装校验失败：期望 v$NEW_VER，实际 v$GOT" >&2
+              exit 1
+            fi
+            rm -rf "$DEST.old"
+            echo "已安装 v$GOT 到 $DEST"
+          fi
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "build=${{ steps.decide.outputs.build }} upstream=${{ steps.check.outputs.short_sha }}"
+          if [ -d "/Applications/ZCode Preview.pending.app" ]; then
+            echo "待换入：$(defaults read "/Applications/ZCode Preview.pending.app/Contents/Info.plist" CFBundleShortVersionString)"
+          fi
+          echo "已安装：$(defaults read "/Applications/ZCode Preview.app/Contents/Info.plist" CFBundleShortVersionString)"
