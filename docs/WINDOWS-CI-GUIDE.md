@@ -84,12 +84,22 @@ cd G:\actions-runner-zcode-win
 cd G:\actions-runner-zcode-win
 .\config.cmd --url https://github.com/liqianjie/ZCode --token <TOKEN> `
   --name zcode-win-01 --labels zcode-win --work _work --replace `
-  --runasservice --unattended
+  --runasservice --unattended --windowslogonaccount 'NT AUTHORITY\NETWORK SERVICE'
 ```
 
-代价：服务账户有自己的用户配置文件，pnpm store 与 electron 缓存会和你的登录账户**各存一份**
-（多占约 8–15G），且不会继承你用户目录下的 `.npmrc` / 代理 / 用户证书。
-`G:\` 已授予 `Authenticated Users:(M)`，默认服务账户有写权限，无需额外授权。
+服务化后有几个必知差异（都已在 workflow 里处理）：
+
+- **`bash` 解析不到**：机器级 `PATH` 里 Git 只暴露 `cmd` 目录，而 `bash.exe` 位于 `bin`，
+  runner 程序也没有 Git 位置的兜底查找。workflow 已改用绝对路径的 shell 模板
+  （`C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}`）。
+- **electron-builder 解压 `winCodeSign` 必失败**：服务账户没有创建符号链接的特权。
+  必须预置共享缓存，见第 5 节。
+- **electron-builder 缓存另起一份**：`%LOCALAPPDATA%` 落在
+  `C:\Windows\ServiceProfiles\NetworkService\AppData\Local`。
+  pnpm store 不受影响 —— 它按**项目所在盘符**定位（`G:\.pnpm-store\v10`），不跟用户走，
+  服务账户照样复用同一份。
+- 不继承你用户目录下的 `.npmrc` / 代理 / 用户证书。
+- `G:\` 已授予 `Authenticated Users:(M)`，默认服务账户有写权限，无需额外授权。
 
 ### 3.4 验证注册结果
 
@@ -157,6 +167,56 @@ ${productName}-${version}-win-x64${_TEST}.{ext}
 **NSIS / Electron 下载超时**
 workflow 已设 `ELECTRON_MIRROR` 与 `ELECTRON_BUILDER_BINARIES_MIRROR` 走 npmmirror；
 上游 `bundle.mjs` 自身还有一轮 404 回退镜像与重试（`nsis-resources-`、`connection reset` 等信号）。
+
+**打包步骤失败：`Cannot create symbolic link`（服务账户缺特权）**
+
+现象：`打包 Windows 桌面安装包` 步骤在跑了约 10 分钟后失败，日志里是
+
+```
+⨯ cannot execute  cause=exit status 2
+ERROR: Cannot create symbolic link : 客户端没有所需的特权 :
+  ...\electron-builder\Cache\winCodeSign\<随机数>\darwin\10.12\lib\libcrypto.dylib
+command='...\7za.exe' x -snld -bd '...\winCodeSign-2.6.0.7z' '-o...'
+```
+
+原因：`winCodeSign-2.6.0.7z` 里打包了 **macOS 的 `.dylib` 符号链接**。
+在 Windows 上创建符号链接需要 `SeCreateSymbolicLinkPrivilege`，该特权默认只授予管理员令牌；
+runner 以 `NETWORK SERVICE` 常驻时没有它，于是 7-Zip 解压失败并重试 4 次后整体失败。
+
+这也解释了「本地/用户会话下能打包、服务账户下必失败」的差异 —— 前者是管理员令牌。
+
+**解决方式：预置共享缓存，命中后完全跳过「下载 + 解压」分支。**
+
+workflow 里已设 `ELECTRON_BUILDER_CACHE: G:/electron-builder-cache`，
+该目录需预先用**管理员**会话准备好（管理员才能解压出这些符号链接）：
+
+```powershell
+# 1) 复制一份已有缓存（本地 %LOCALAPPDATA% 下通常已经有一份可用的）
+$src = "$env:LOCALAPPDATA\electron-builder\Cache"
+$dst = "G:\electron-builder-cache"
+robocopy $src $dst /E /COPY:DAT | Out-Null
+
+# 2) 把 darwin 下两个符号链接换成真实文件副本（消除特权依赖）
+$lib = "$dst\winCodeSign\winCodeSign-2.6.0\darwin\10.12\lib"
+Remove-Item "$lib\libcrypto.dylib","$lib\libssl.dylib" -Force -ErrorAction SilentlyContinue
+Copy-Item "$lib\libcrypto.1.0.0.dylib" "$lib\libcrypto.dylib"
+Copy-Item "$lib\libssl.1.0.0.dylib"   "$lib\libssl.dylib"
+
+# 3) 授权服务账户（S-1-5-20 = NETWORK SERVICE）
+icacls $dst /grant "*S-1-5-20:(OI)(CI)F" /T
+```
+
+验证（应为 0）：
+
+```bash
+find /g/electron-builder-cache -type l | wc -l
+```
+
+流水线里加了一步「预检 electron-builder 缓存」，缓存缺失或残留符号链接时会**立即**失败，
+不再白跑十几分钟到解压阶段才报错。若将来缓存被删，按上面三步重建即可。
+
+> 若改用你自己的账户跑 runner 服务（需要 Windows 密码），这个坑不会出现，
+> 但 `ELECTRON_BUILDER_CACHE` 仍然有效，两侧共用同一份缓存。
 
 **磁盘被吃满**
 `actions/checkout` 默认执行 `git clean -ffdx`，每次会清掉 `src/` 下的 `node_modules` 与 `dist`，
