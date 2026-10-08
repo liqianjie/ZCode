@@ -64,7 +64,6 @@ jobs:
     runs-on: [self-hosted, windows, x64, zcode-win]
     timeout-minutes: 120
     env:
-      GITHUB_TOKEN: ${{ github.token }}
       ZCODE_ENV: ${{ inputs.backend_env }}
       # 品牌化只改写 preview 身份（productName/appId -> 千寻）。
       # production 后端要保住千寻身份，就必须显式打开 preview identity，否则产物会退回 ZCode 身份。
@@ -173,6 +172,10 @@ jobs:
       - name: 发布 Release
         if: inputs.publish_release
         env:
+          # 只在真正需要写 Release 的这一步注入 token。
+          # 不要提到 job 级：pnpm install 会执行第三方 postinstall 脚本，
+          # 让它们拿到 write 权限的 token 是没必要的暴露面。
+          GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: win-${{ steps.upstream.outputs.short }}
           RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ inputs.backend_env }})
           RELEASE_NOTES: |
