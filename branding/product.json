@@ -1,0 +1,13 @@
+{
+  "productName": "千寻",
+  "appId": "io.qianxun.desktop",
+  "linuxExecutableName": "qianxun",
+  "linuxPackageName": "qianxun",
+  "domain": "qianxun.io",
+  "legacyProductName": "ZCode Preview",
+  "notes": [
+    "数据无缝沿用：desktopRuntimeEnv.ts 中 runtimeApplicationName 硬编码为 ZCode Preview，不随 productName 变化，",
+    "因此 Electron userData / 凭据 / 会话目录保持原路径，品牌化升级后无需重新登录。",
+    "本目录由 zcode-autoupdate workflow 在检出上游源码后应用（apply.mjs），fork 的 main 分支不合并上游，上游更新自动生效。"
+  ]
+}
