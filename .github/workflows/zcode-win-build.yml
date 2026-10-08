@@ -71,7 +71,14 @@ jobs:
       ZCODE_PREVIEW_IDENTITY: ${{ inputs.backend_env == 'production' && '1' || '0' }}
     defaults:
       run:
-        shell: bash
+        # 不能用 shell: bash —— runner 以 Windows 服务（NETWORK SERVICE）常驻，服务账户只有机器级
+        # PATH，其中 Git 只暴露了 cmd 目录，而 bash.exe 位于 bin 目录，所以 bash 解析不到；
+        # runner 程序自身也没有 Git 安装位置的兜底查找（已核对二进制字符串）。
+        # 这里直接用绝对路径调用 Git for Windows 的 bash，等价于内置模板
+        # bash --noprofile --norc -eo pipefail。用 8.3 短名是因为 GitHub 只按第一个空格切分
+        # 这个模板，路径里不能出现空格。
+        # 已实测：MSYS bash 启动时会把 /mingw64/bin:/usr/bin 前置进 PATH，coreutils 与 git 均可用。
+        shell: 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         working-directory: src
     steps:
       - name: 解析上游 ref
@@ -138,8 +145,39 @@ jobs:
 
       # 依赖不做 actions/cache：self-hosted runner 的 pnpm store 本就常驻磁盘、跨任务复用
       # （node_modules 硬链接自 store，几乎零额外占用），再打包一份缓存反而多占十几 G。
+      #
+      # 首跑踩到两个坑，都在这一步：
+      # 1) koffi 的 cnoke 预编译二进制加载失败时会退回「源码编译」，此时必须有 CMake，否则直接报
+      #    "CMake does not seem to be available" 并让整个 install 失败。
+      #    这里挂上 VS2019 BuildTools 自带的 CMake（8.3 短名规避路径空格）。
+      # 2) esbuild / electron 的 postinstall 会 spawn 刚解包出来的 node.exe，Windows 上偶发
+      #    EBUSY（实时扫描或索引锁住文件）。属瞬时故障，重试可自愈，故做 3 次退避重试。
       - name: 安装依赖
-        run: pnpm install --frozen-lockfile
+        run: |
+          set -uo pipefail
+
+          CMAKE_BIN="/c/PROGRA~2/MICROS~2/2019/BUILDT~1/Common7/IDE/COMMON~1/MICROS~1/CMake/CMake/bin"
+          if [ -x "$CMAKE_BIN/cmake.exe" ]; then
+            export PATH="$CMAKE_BIN:$PATH"
+            echo "CMake: $(cmake --version | head -1)"
+          else
+            echo "::warning::未找到 VS2019 自带 CMake，若 koffi 走源码编译则本步会失败"
+          fi
+
+          for attempt in 1 2 3; do
+            echo "::group::pnpm install --frozen-lockfile（第 ${attempt}/3 次）"
+            if pnpm install --frozen-lockfile; then
+              echo "::endgroup::"
+              echo "依赖安装成功（第 ${attempt} 次）"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::pnpm install 第 ${attempt} 次失败，10 秒后重试"
+            sleep 10
+          done
+
+          echo "pnpm install 连续 3 次失败，终止" >&2
+          exit 1
 
       - name: 打包 Windows 桌面安装包
         run: pnpm bundle:desktop -- --os win --arch x64
