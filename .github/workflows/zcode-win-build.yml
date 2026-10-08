@@ -1,0 +1,197 @@
+name: zcode-win-build
+
+# Windows 桌面安装包流水线（fork 专用，品牌：千寻 qianxun.io）
+#
+# 流程：检出上游 zai-org/ZCode -> 应用千寻品牌化 -> 追加免安装 zip 目标
+#       -> 在 self-hosted Windows runner 上打包 Windows x64 安装包 -> 上传产物（可选发 Release）
+#
+# 为什么走 self-hosted：Windows 打包要下 Electron 41 运行时、NSIS 资源，并需要约 15-25G 工作区。
+# 放在自有机器上可以长期复用 pnpm store 与 electron 缓存，不消耗托管 runner 额度，
+# 也不必每次从零下载 Electron 与 NSIS。
+#
+# ---- 安全提示（务必遵守）----
+# 本仓库是 public。self-hosted runner 绝不可对 pull_request / pull_request_target 开放，
+# 否则任何 fork 的 PR 都能在你的打包机上执行任意代码（可读写本机文件、拿 runner 身份连内网）。
+# 本文件只保留 workflow_dispatch（手动触发），不要为了"方便"加 PR 触发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 ref（分支名 / tag / commit sha），留空 = zai-org/ZCode main 最新提交"
+        required: false
+        type: string
+        default: ""
+      backend_env:
+        description: "后端环境：test 产出「千寻-<ver>-win-x64_TEST.exe」；production 产出不带 _TEST 后缀的生产包"
+        required: true
+        type: choice
+        options:
+          - test
+          - production
+        default: test
+      desktop_zip:
+        description: "额外产出免安装 zip（win-unpacked 打成的绿色包）"
+        required: true
+        type: boolean
+        default: true
+      publish_release:
+        description: "构建成功后创建/更新 GitHub Release 并上传产物（tag: win-<short_sha>）"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 同一时间只允许一个 Windows 打包任务，避免两个 job 抢同一份 dist 与 pnpm store。
+concurrency:
+  group: zcode-win-build
+  cancel-in-progress: false
+
+env:
+  # 国内网络下走镜像，避免 Electron / NSIS 资源下载超时（上游脚本自身也有一套补丁镜像兜底）
+  ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
+  # Windows 桌面包不依赖 mock-cdn remote 资产；上游已为此留开关，跳过可省下数十分钟串行下载。
+  ZCODE_SKIP_REMOTE_ASSETS: "1"
+  # 品牌产品名（单一来源为 branding/product.json；此处与产物校验步骤共用同名变量）
+  PRODUCT_NAME: 千寻
+
+jobs:
+  build-win-x64:
+    # label zcode-win 由本机 self-hosted runner 注册，见 docs/WINDOWS-CI-GUIDE.md
+    runs-on: [self-hosted, windows, x64, zcode-win]
+    timeout-minutes: 120
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      ZCODE_ENV: ${{ inputs.backend_env }}
+      # 品牌化只改写 preview 身份（productName/appId -> 千寻）。
+      # production 后端要保住千寻身份，就必须显式打开 preview identity，否则产物会退回 ZCode 身份。
+      ZCODE_PREVIEW_IDENTITY: ${{ inputs.backend_env == 'production' && '1' || '0' }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    steps:
+      - name: 解析上游 ref
+        id: upstream
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          RAW="${{ inputs.upstream_ref }}"
+          if [ -z "$RAW" ]; then
+            RAW=main
+          fi
+          if [[ "$RAW" =~ ^[0-9a-f]{7,40}$ ]]; then
+            SHA="$RAW"
+          else
+            SHA=$(git ls-remote https://github.com/zai-org/ZCode.git "refs/heads/$RAW" "refs/tags/$RAW" | awk '{print $1}' | head -1)
+          fi
+          if [ -z "$SHA" ]; then
+            echo "无法解析上游 ref: $RAW" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "上游 $RAW = ${SHA:0:7}"
+
+      - name: 检出上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: zai-org/ZCode
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      # .branding-src 装的是本 fork main 上的「上游检出后要套的补丁」，目前包含：
+      #   branding/  —— 品牌化与图标替换（macOS 流水线也在用同一份）
+      #   branding/patch-win-target.mjs    —— Windows 追加 zip 目标
+      #   branding/publish-win-release.mjs —— 发布 Release
+      - name: 检出 fork 侧补丁
+        uses: actions/checkout@v4
+        with:
+          repository: liqianjie/ZCode
+          ref: main
+          path: .branding-src
+          sparse-checkout: |
+            branding
+          fetch-depth: 1
+
+      - name: 应用千寻品牌化
+        run: node "$GITHUB_WORKSPACE/.branding-src/branding/apply.mjs"
+
+      - name: 追加 Windows 免安装 zip 目标
+        if: inputs.desktop_zip
+        run: node "$GITHUB_WORKSPACE/.branding-src/branding/patch-win-target.mjs"
+
+      - name: 安装 Node 24.14.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+
+      - name: 安装 pnpm 10.33.2
+        run: |
+          set -euo pipefail
+          npm install -g pnpm@10.33.2
+          echo "node $(node -v) / pnpm $(pnpm -v)"
+
+      # 依赖不做 actions/cache：self-hosted runner 的 pnpm store 本就常驻磁盘、跨任务复用
+      # （node_modules 硬链接自 store，几乎零额外占用），再打包一份缓存反而多占十几 G。
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 打包 Windows 桌面安装包
+        run: pnpm bundle:desktop -- --os win --arch x64
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          cd packages/desktop/dist
+          ls -lh
+          shopt -s nullglob
+          installers=( *.exe )
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "未找到 NSIS 安装程序（*.exe），打包结果不符合预期" >&2
+            exit 1
+          fi
+          echo "安装程序: ${installers[*]}"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-win-x64-${{ steps.upstream.outputs.short }}-run${{ github.run_number }}
+          # 注意：upload-artifact 的 path 相对 GITHUB_WORKSPACE，不受 step working-directory 影响
+          path: |
+            src/packages/desktop/dist/*.exe
+            src/packages/desktop/dist/*.zip
+            src/packages/desktop/dist/*.blockmap
+            src/packages/desktop/dist/latest.yml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布 Release
+        if: inputs.publish_release
+        env:
+          RELEASE_TAG: win-${{ steps.upstream.outputs.short }}
+          RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ inputs.backend_env }})
+          RELEASE_NOTES: |
+            自动构建 [ci skip]
+
+            - 上游：zai-org/ZCode@${{ steps.upstream.outputs.short }}，品牌化：千寻（qianxun.io）
+            - 后端环境：${{ inputs.backend_env }}
+            - 产物：NSIS 安装程序${{ inputs.desktop_zip && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
+            - runner：self-hosted Windows x64
+          DIST_DIR: src/packages/desktop/dist
+        run: |
+          set -euo pipefail
+          node "$GITHUB_WORKSPACE/.branding-src/branding/publish-win-release.mjs"
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "上游 ref   = ${{ steps.upstream.outputs.short }}"
+          echo "后端环境   = ${{ inputs.backend_env }}"
+          echo "免安装 zip = ${{ inputs.desktop_zip }}"
+          echo "发布 Release = ${{ inputs.publish_release }}"
+          ls -lh packages/desktop/dist 2>/dev/null || echo "dist 不存在（构建未走到打包阶段）"
