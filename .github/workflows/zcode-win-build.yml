@@ -302,6 +302,7 @@ jobs:
           pnpm bundle:desktop -- --os win --arch x64
 
       - name: 校验产物
+        id: verify
         if: steps.decide.outputs.build == 'true'
         run: |
           set -euo pipefail
@@ -337,41 +338,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: 发布 Release
-        if: steps.decide.outputs.build == 'true' && env.EFF_PUBLISH == 'true'
-        env:
-          # 只在真正需要写 Release 的这一步注入 token。
-          # 不要提到 job 级：pnpm install 会执行第三方 postinstall 脚本，
-          # 让它们拿到 write 权限的 token 是没必要的暴露面。
-          GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_TAG: win-${{ steps.upstream.outputs.short }}
-          RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ env.EFF_BACKEND_ENV }})
-          RELEASE_NOTES: |
-            自动构建 [ci skip]
-
-            - 上游：zai-org/ZCode@${{ steps.upstream.outputs.short }}，品牌化：千寻（qianxun.io）
-            - 后端环境：${{ env.EFF_BACKEND_ENV }}
-            - 产物：NSIS 安装程序${{ env.EFF_DESKTOP_ZIP == 'true' && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
-            - runner：self-hosted Windows x64
-          DIST_DIR: src/packages/desktop/dist
-        run: |
-          set -euo pipefail
-          # 先把上游提交对象与 tag 一起推到 fork（不经过 main、不触碰 workflow 文件），
-          # 让 win-<short> tag 精确指向本次构建的上游提交，而不是 fork main 的 HEAD。
-          # 这一步同时也是「已构建过」判定的标记来源。
-          git push --force \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" \
-            "HEAD:refs/tags/win-${{ steps.upstream.outputs.short }}"
-          node "$GITHUB_WORKSPACE/.branding-src/branding/publish-win-release.mjs"
-
       # 把包投递到本机共享目录并写「待装标记」。
       #
       # 为什么不在 job 里直接静默安装：runner 以 NETWORK SERVICE 常驻（Session 0），
       # 而 electron-builder 的 Windows 安装器是 per-user 安装（装到 %LOCALAPPDATA%\Programs\千寻）。
       # 由服务账户执行会把包装进 C:\Windows\ServiceProfiles\NetworkService\...，用户根本看不到。
-      # 所以这里只负责投递，真正的安装交给用户会话里的计划任务（install-pending.ps1）。
+      # 所以这里只负责投递，真正的安装交给用户会话里的计划任务（win-autoinstall.ps1）。
+      #
+      # 为什么排在「发布 Release」之前：投递是本机拿到新版的唯一通道，
+      # 不能因为发布失败（API 限流、网络抖动）就被连带跳过。守卫只要求「打包并校验成功」。
       - name: 投递到本机安装区
-        if: steps.decide.outputs.build == 'true'
+        if: ${{ !cancelled() && steps.decide.outputs.build == 'true' && steps.verify.conclusion == 'success' }}
         env:
           DELIVERY_DIR_WIN: G:/zcode-win-dist
         run: |
@@ -405,6 +382,43 @@ jobs:
           ls -lh "$DELIVER_DIR"
           echo "待装标记:"
           cat "$DELIVER_DIR/install-pending.json"
+
+      - name: 发布 Release
+        if: ${{ !cancelled() && steps.decide.outputs.build == 'true' && env.EFF_PUBLISH == 'true' && steps.verify.conclusion == 'success' }}
+        env:
+          # 只在真正需要写 Release 的这一步注入 token。
+          # 不要提到 job 级：pnpm install 会执行第三方 postinstall 脚本，
+          # 让它们拿到 write 权限的 token 是没必要的暴露面。
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: win-${{ steps.upstream.outputs.short }}
+          RELEASE_TITLE: 千寻 Windows x64 (${{ steps.upstream.outputs.short }} / ${{ env.EFF_BACKEND_ENV }})
+          RELEASE_NOTES: |
+            自动构建 [ci skip]
+
+            - 上游：zai-org/ZCode@${{ steps.upstream.outputs.short }}，品牌化：千寻（qianxun.io）
+            - 后端环境：${{ env.EFF_BACKEND_ENV }}
+            - 产物：NSIS 安装程序${{ env.EFF_DESKTOP_ZIP == 'true' && ' + 免安装 zip' || '' }}（win x64，未签名本地构建）
+            - runner：self-hosted Windows x64
+          DIST_DIR: src/packages/desktop/dist
+          # git 的「仓库属主不匹配」安全检查（safe.directory）。
+          #
+          # runner 以 NETWORK SERVICE 常驻，而 G:\actions-runner-zcode-win\_work\... 工作区
+          # 的属主是交互用户 qianjieli。git 2.35.2+ 会判定为 dubious ownership 并直接
+          # exit 128（fatal: detected dubious ownership in repository）。
+          # actions/checkout 只在自己的临时 HOME 里放行，后续自定义步骤不受益。
+          # 这里用 GIT_CONFIG_COUNT 机制只对本次步骤生效，绝不写任何持久配置。
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: "*"
+        run: |
+          set -euo pipefail
+          # 先把上游提交对象与 tag 一起推到 fork（不经过 main、不触碰 workflow 文件），
+          # 让 win-<short> tag 精确指向本次构建的上游提交，而不是 fork main 的 HEAD。
+          # 这一步同时也是「已构建过」判定的标记来源。
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" \
+            "HEAD:refs/tags/win-${{ steps.upstream.outputs.short }}"
+          node "$GITHUB_WORKSPACE/.branding-src/branding/publish-win-release.mjs"
 
       - name: 清理构建产物（节省磁盘）
         if: always() && steps.decide.outputs.build == 'true'
