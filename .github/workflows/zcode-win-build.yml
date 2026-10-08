@@ -53,6 +53,18 @@ env:
   # 国内网络下走镜像，避免 Electron / NSIS 资源下载超时（上游脚本自身也有一套补丁镜像兜底）
   ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
   ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
+  # electron-builder 的辅助二进制缓存根目录（等价于 %LOCALAPPDATA%\electron-builder\Cache）。
+  #
+  # 为什么必须显式指定：runner 以 NETWORK SERVICE 常驻，而该账户没有
+  # SeCreateSymbolicLinkPrivilege（创建符号链接需要管理员令牌）。electron-builder 的
+  # winCodeSign-2.6.0.7z 里带了 darwin/10.12/lib/{libcrypto,libssl}.dylib 两个符号链接，
+  # 服务账户解压必然失败（ERROR: Cannot create symbolic link : 客户端没有所需的特权），
+  # 而且会重试 4 次后整体失败。
+  #
+  # 解法是预先把这个缓存放到共享目录（已用管理员权限解压并去掉符号链接），
+  # 让 electron-builder 直接命中缓存、完全不走进「下载 + 解压」分支。
+  # 目录权限已授予 NETWORK SERVICE 完全控制。见 docs/WINDOWS-CI-GUIDE.md。
+  ELECTRON_BUILDER_CACHE: G:/electron-builder-cache
   # Windows 桌面包不依赖 mock-cdn remote 资产；上游已为此留开关，跳过可省下数十分钟串行下载。
   ZCODE_SKIP_REMOTE_ASSETS: "1"
   # 品牌产品名（单一来源为 branding/product.json；此处与产物校验步骤共用同名变量）
@@ -178,6 +190,38 @@ jobs:
 
           echo "pnpm install 连续 3 次失败，终止" >&2
           exit 1
+
+      # 服务账户解压 winCodeSign 必然失败（缺符号链接特权），所以缓存必须预置。
+      # 这里做一次快速预检：5 秒内暴露缓存缺失 / 权限问题，
+      # 而不是等 electron-builder 跑完十几分钟的打包后才在解压阶段报错。
+      - name: 预检 electron-builder 缓存
+        run: |
+          set -euo pipefail
+          if [ -z "${ELECTRON_BUILDER_CACHE:-}" ]; then
+            echo "::error::ELECTRON_BUILDER_CACHE 未设置。服务账户无符号链接特权，无法自行解压 winCodeSign。"
+            exit 1
+          fi
+          BASH_CACHE="$(cygpath -u "$ELECTRON_BUILDER_CACHE" 2>/dev/null || printf '%s' "$ELECTRON_BUILDER_CACHE")"
+          echo "缓存根目录: $ELECTRON_BUILDER_CACHE  (bash: $BASH_CACHE)"
+          missing=0
+          for sub in winCodeSign/winCodeSign-2.6.0 nsis; do
+            if [ -d "$BASH_CACHE/$sub" ]; then
+              echo "  OK   $sub"
+            else
+              echo "::error::缓存缺失: $sub（预期位于 $ELECTRON_BUILDER_CACHE）"
+              missing=1
+            fi
+          done
+          # winCodeSign 里若残留符号链接，服务账户读取虽可行，但预置时已明确去掉，
+          # 这里复核一次，防止有人用带链接的方式重新拷贝。
+          links=$(find "$BASH_CACHE" -type l 2>/dev/null | wc -l)
+          echo "  符号链接数: $links"
+          if [ "$links" -ne 0 ]; then
+            echo "::error::缓存目录存在符号链接（$links 个），服务账户读取可能受限"
+            find "$BASH_CACHE" -type l 2>/dev/null | head -5
+            exit 1
+          fi
+          [ "$missing" -eq 0 ]
 
       - name: 打包 Windows 桌面安装包
         run: pnpm bundle:desktop -- --os win --arch x64
