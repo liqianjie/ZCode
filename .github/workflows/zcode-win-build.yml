@@ -224,7 +224,16 @@ jobs:
           [ "$missing" -eq 0 ]
 
       - name: 打包 Windows 桌面安装包
-        run: pnpm bundle:desktop -- --os win --arch x64
+        run: |
+          set -euo pipefail
+          # bundle.mjs 内部其实也会跑 `pnpm build`（根脚本 = pnpm -r build 全量递归），
+          # 这里显式前置一次有两个目的：
+          # 1) 与 mac 流水线（zcode-autoupdate.yml）行为保持一致；
+          # 2) 若将来 checkout 改为 clean: false 复用工作区，可确保各 workspace 包
+          #    在 electron-builder 取产物前已经是最新，避免把上一次的旧 UI 产物打进安装包。
+          # 代价是首次构建多一遍 tsc；重复构建时上游产物已存在，跳过很快。
+          pnpm build
+          pnpm bundle:desktop -- --os win --arch x64
 
       - name: 校验产物
         run: |
