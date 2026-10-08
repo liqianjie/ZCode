@@ -99,16 +99,9 @@ jobs:
         if: steps.decide.outputs.build == 'true'
         run: npm install -g pnpm@10.33.2
 
-      - name: 恢复依赖缓存
-        if: steps.decide.outputs.build == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/pnpm/store
-            ~/Library/Caches/electron
-          key: zcode-${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            zcode-${{ runner.os }}-pnpm-
+      # 依赖不使用 actions/cache：self-hosted runner 的 pnpm store（~/Library/pnpm/store）
+      # 与 electron 缓存本就常驻磁盘、跨任务复用（node_modules 硬链接自 store，几乎零额外占用），
+      # 再打包一份缓存反而多占约 8G。
 
       - name: 安装依赖并打包桌面应用
         if: steps.decide.outputs.build == 'true'
@@ -124,18 +117,24 @@ jobs:
           SHORT="${{ steps.check.outputs.short_sha }}"
           VER=$(node -p "require('./package.json').version")
           # 把上游提交对象与 tag 推到 fork（不经过 main，不触碰 workflow 文件）
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" "HEAD:refs/tags/auto-$SHORT"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/liqianjie/ZCode.git" "HEAD:refs/tags/auto-$SHORT"
           cd packages/desktop/dist
-          gh release create "auto-$SHORT" -R liqianjie/ZCode \
-            --title "ZCode Preview v${VER} (${SHORT})" \
-            --notes "自动构建 [ci skip]
+          if gh release view "auto-$SHORT" -R liqianjie/ZCode >/dev/null 2>&1; then
+            gh release upload "auto-$SHORT" -R liqianjie/ZCode \
+              "./ZCode Preview-${VER}-mac-arm64_TEST.zip" \
+              "./ZCode Preview-${VER}-mac-arm64_TEST.dmg" --clobber
+          else
+            gh release create "auto-$SHORT" -R liqianjie/ZCode \
+              --title "ZCode Preview v${VER} (${SHORT})" \
+              --notes "自动构建 [ci skip]
 
           - 上游：zai-org/ZCode@${SHORT}（v${VER}）
           - 变体：Preview / TEST 后端 / 未签名本地构建（mac arm64）
           - zip 内含可直接使用的 .app；dmg 为常规安装镜像" \
-            "./ZCode Preview-${VER}-mac-arm64_TEST.zip" \
-            "./ZCode Preview-${VER}-mac-arm64_TEST.dmg"
-          echo "已发布 Release auto-$SHORT（v${VER}）"
+              "./ZCode Preview-${VER}-mac-arm64_TEST.zip" \
+              "./ZCode Preview-${VER}-mac-arm64_TEST.dmg"
+          fi
+          echo "已发布 Release auto-${SHORT}（v${VER}）"
 
       - name: 安装到本机
         if: steps.decide.outputs.build == 'true'
@@ -164,6 +163,12 @@ jobs:
             rm -rf "$DEST.old"
             echo "已安装 v$GOT 到 $DEST"
           fi
+
+      - name: 清理构建产物（节省磁盘）
+        if: always() && steps.decide.outputs.build == 'true'
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/packages/desktop/dist"
+          echo "已清理 dist 构建产物"
 
       - name: 汇总
         if: always()
