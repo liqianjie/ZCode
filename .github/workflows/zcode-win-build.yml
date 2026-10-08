@@ -60,8 +60,9 @@ env:
 
 jobs:
   build-win-x64:
-    # label zcode-win 由本机 self-hosted runner 注册，见 docs/WINDOWS-CI-GUIDE.md
-    runs-on: [self-hosted, windows, x64, zcode-win]
+    # label 与 runner 注册结果逐字一致（GitHub 侧实际标签：self-hosted / Windows / X64 / zcode-win）。
+    # 不依赖标签大小写不敏感的约定，避免 job 一直卡在 queued 等不到 runner。
+    runs-on: [self-hosted, Windows, X64, zcode-win]
     timeout-minutes: 120
     env:
       ZCODE_ENV: ${{ inputs.backend_env }}
