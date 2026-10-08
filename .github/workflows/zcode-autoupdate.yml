@@ -64,10 +64,10 @@ jobs:
           echo "short_sha=$SHORT" >> "$GITHUB_OUTPUT"
           if gh release view "auto-$SHORT" -R liqianjie/ZCode >/dev/null 2>&1; then
             echo "exists=true"  >> "$GITHUB_OUTPUT"
-            echo "上游 main = $SHORT，对应 Release 已存在"
+            echo "上游 main = ${SHORT}，对应 Release 已存在"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "上游 main = $SHORT，发现新版本"
+            echo "上游 main = ${SHORT}，发现新版本"
           fi
 
       - name: 是否需要构建
@@ -79,7 +79,7 @@ jobs:
             echo "已是最新且已发布，本次不构建"
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "开始构建（force_build=$FORCE）"
+            echo "开始构建（force_build=${FORCE}）"
           fi
 
       - name: 检出上游源码
@@ -149,7 +149,7 @@ jobs:
             rm -rf "$PENDING"
             cp -R "$SRC" "$PENDING"
             osascript -e "display notification \"v${NEW_VER} 已就绪，退出并重新打开 ZCode Preview 后生效\" with title \"ZCode 自动更新\"" 2>/dev/null || true
-            echo "应用运行中：v$NEW_VER 已暂存到 $PENDING，应用退出后自动换入"
+            echo "应用运行中：v${NEW_VER} 已暂存到 ${PENDING}，应用退出后自动换入"
           else
             rm -rf "$DEST.old"
             if [ -d "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
@@ -158,7 +158,7 @@ jobs:
             xattr -rd com.apple.quarantine "$DEST" 2>/dev/null || true
             GOT=$(defaults read "$DEST/Contents/Info.plist" CFBundleShortVersionString)
             if [ "$GOT" != "$NEW_VER" ]; then
-              echo "安装校验失败：期望 v$NEW_VER，实际 v$GOT" >&2
+              echo "安装校验失败：期望 v${NEW_VER}，实际 v${GOT}" >&2
               exit 1
             fi
             rm -rf "$DEST.old"
